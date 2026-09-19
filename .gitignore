@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 *.pdf
 .DS_Store
+output/
+test_output/
+*.log
