@@ -85,6 +85,21 @@ def get_catalogue() -> List[Dict[str, Any]]:
         "p12_frame_gusset_tag": ("Frame Gusset Tag", "Tier C (Small Hardware)", "Triangular chassis reinforcement gusset with lightening aperture")
     }
 
+    baseline_max_fit = {
+        "p01_front_fairing": 14,
+        "p02_rear_tail_hugger": 25,
+        "p03_radiator_shroud": 27,
+        "p04_engine_skid_plate": 21,
+        "p05_tail_tidy_bracket": 60,
+        "p06_rearset_footpeg_hanger": 80,
+        "p07_exhaust_heat_shield": 122,
+        "p08_triple_tree_fork_brace": 94,
+        "p09_radiator_grill_bracket": 168,
+        "p10_brake_caliper_bracket": 135,
+        "p11_handlebar_clamp": 262,
+        "p12_frame_gusset_tag": 1170
+    }
+
     for name, obj in named_parts:
         title, tier, desc = friendly_names.get(name, (name, "General Parts", ""))
         w_mm = round(obj.width / 100.0, 1)
@@ -101,10 +116,73 @@ def get_catalogue() -> List[Dict[str, Any]]:
             "height_mm": h_mm,
             "area_cm2": area_cm2,
             "holes": holes_count,
+            "max_fit": baseline_max_fit.get(name, 10),
             "svg_url": f"/parts/{name}.svg"
         })
 
     return catalogue
+
+
+_MAX_FIT_CACHE: Dict[Tuple[str, float, float, float, float], int] = {}
+
+def calculate_max_fit(
+    part_name: str,
+    sheet_w_mm: float = 1220.0,
+    sheet_h_mm: float = 2440.0,
+    kerf_mm: float = 2.0,
+    margin_mm: float = 5.0
+) -> int:
+    """Calculates or retrieves the maximum number of instances of a part that fit on a sheet."""
+    cache_key = (part_name, round(sheet_w_mm, 1), round(sheet_h_mm, 1), round(kerf_mm, 2), round(margin_mm, 2))
+    if cache_key in _MAX_FIT_CACHE:
+        return _MAX_FIT_CACHE[cache_key]
+
+    is_standard = (
+        abs(sheet_w_mm - 1220.0) < 1.0 and
+        abs(sheet_h_mm - 2440.0) < 1.0 and
+        abs(kerf_mm - 2.0) < 0.1 and
+        abs(margin_mm - 5.0) < 0.1
+    )
+    baseline = {
+        "p01_front_fairing": 14,
+        "p02_rear_tail_hugger": 25,
+        "p03_radiator_shroud": 27,
+        "p04_engine_skid_plate": 21,
+        "p05_tail_tidy_bracket": 60,
+        "p06_rearset_footpeg_hanger": 80,
+        "p07_exhaust_heat_shield": 122,
+        "p08_triple_tree_fork_brace": 94,
+        "p09_radiator_grill_bracket": 168,
+        "p10_brake_caliper_bracket": 135,
+        "p11_handlebar_clamp": 262,
+        "p12_frame_gusset_tag": 1170
+    }
+    if is_standard and part_name in baseline:
+        _MAX_FIT_CACHE[cache_key] = baseline[part_name]
+        return baseline[part_name]
+
+    try:
+        from industrial_nest import IndustrialNestingEngine
+        named_parts = dict(get_named_parts())
+        if part_name not in named_parts:
+            return 1
+        part_obj = named_parts[part_name]
+        engine = IndustrialNestingEngine(
+            sheet_w_mm=sheet_w_mm,
+            sheet_h_mm=sheet_h_mm,
+            kerf_mm=kerf_mm,
+            margin_mm=margin_mm
+        )
+        res = engine.optimize_multi_part_nesting([(part_name, part_obj)])
+        count = max(1, res.total_parts_count)
+        _MAX_FIT_CACHE[cache_key] = count
+        return count
+    except Exception:
+        base_count = baseline.get(part_name, 10)
+        area_factor = (sheet_w_mm * sheet_h_mm) / (1220.0 * 2440.0)
+        est = max(1, int(base_count * area_factor))
+        _MAX_FIT_CACHE[cache_key] = est
+        return est
 
 
 def parse_sheet_metadata(svg_path: str) -> Dict[str, Any]:
@@ -941,6 +1019,18 @@ HTML_PAGE = r"""<!DOCTYPE html>
       cursor: pointer;
     }
     .quick-btn:hover { background: #334155; color: white; }
+    .quick-btn-max {
+      background: rgba(56, 189, 248, 0.12);
+      border-color: rgba(56, 189, 248, 0.4);
+      color: #38bdf8;
+      font-weight: 700;
+    }
+    .quick-btn-max:hover {
+      background: #0284c7;
+      border-color: #38bdf8;
+      color: #ffffff;
+      box-shadow: 0 0 10px rgba(56, 189, 248, 0.4);
+    }
 
     /* ==========================================================================
        NORMAL SHEET VIEWER
@@ -1601,12 +1691,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
           <div class="stepper-row">
             <div class="stepper-controls">
               <button class="step-btn" onclick="modifyQty('${item.id}', -1)">−</button>
-              <input id="input-qty-${item.id}" class="step-input" type="number" min="0" max="1000" value="${qty}" onchange="setQty('${item.id}', this.value)" />
+              <input id="input-qty-${item.id}" class="step-input" type="number" min="0" max="5000" value="${qty}" onchange="setQty('${item.id}', this.value)" />
               <button class="step-btn" onclick="modifyQty('${item.id}', 1)">＋</button>
             </div>
             <div class="quick-adds">
               <button class="quick-btn" onclick="modifyQty('${item.id}', 5)">+5</button>
               <button class="quick-btn" onclick="modifyQty('${item.id}', 10)">+10</button>
+              <button class="quick-btn quick-btn-max" onclick="setMaxFit('${item.id}')" title="Max Fit: Fill sheet with ${item.max_fit || ''} units">Max</button>
             </div>
           </div>
         `;
@@ -1620,6 +1711,38 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const cur = orderQuantities[partId] || 0;
       const next = Math.max(0, cur + delta);
       setQty(partId, next);
+    }
+
+    async function setMaxFit(partId) {
+      const sheetW = parseFloat(document.getElementById('input-sheet-w') ? document.getElementById('input-sheet-w').value : 1220) || 1220.0;
+      const sheetH = parseFloat(document.getElementById('input-sheet-h') ? document.getElementById('input-sheet-h').value : 2440) || 2440.0;
+      const kerf = parseFloat(document.getElementById('input-kerf') ? document.getElementById('input-kerf').value : 2.0) || 2.0;
+      const margin = parseFloat(document.getElementById('input-margin') ? document.getElementById('input-margin').value : 5.0) || 5.0;
+
+      const item = catalogueData.find(c => c.id === partId);
+      // Fast path: if standard sheet dimensions (1220x2440, kerf 2, margin 5) and item has precomputed max_fit
+      if (item && item.max_fit && Math.abs(sheetW - 1220) < 1 && Math.abs(sheetH - 2440) < 1 && Math.abs(kerf - 2) < 0.1 && Math.abs(margin - 5) < 0.1) {
+        setQty(partId, item.max_fit);
+        return;
+      }
+
+      // If custom sheet or params, fetch from API
+      try {
+        const res = await fetch(`/api/max_fit?part=${partId}&w=${sheetW}&h=${sheetH}&kerf=${kerf}&margin=${margin}`);
+        const data = await res.json();
+        if (data && data.max_fit) {
+          setQty(partId, data.max_fit);
+          return;
+        }
+      } catch (e) {
+        console.warn('Could not fetch dynamic max fit:', e);
+      }
+
+      // Fallback
+      if (item && item.max_fit) {
+        const areaRatio = (sheetW * sheetH) / (1220.0 * 2440.0);
+        setQty(partId, Math.max(1, Math.floor(item.max_fit * areaRatio)));
+      }
     }
 
     function setQty(partId, val) {
@@ -2115,6 +2238,22 @@ class VisualizerRequestHandler(SimpleHTTPRequestHandler):
             self.end_headers()
             batches = get_all_batches_grouped()
             self.wfile.write(json.dumps(batches).encode("utf-8"))
+            return
+
+        elif path == "/api/max_fit":
+            query = parse_qs(parsed.query)
+            part_id = query.get("part", [""])[0]
+            sheet_w = float(query.get("w", [1220.0])[0])
+            sheet_h = float(query.get("h", [2440.0])[0])
+            kerf = float(query.get("kerf", [2.0])[0])
+            margin = float(query.get("margin", [5.0])[0])
+
+            max_fit_count = calculate_max_fit(part_id, sheet_w, sheet_h, kerf, margin)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps({"part_id": part_id, "max_fit": max_fit_count}).encode("utf-8"))
             return
 
         elif path.startswith("/parts/"):
