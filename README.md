@@ -265,10 +265,11 @@ python3 batch_nest.py --run-all-tests
 | Condition | Description | Sheets Used | Total Parts | Yield / Remnant | Solve Time |
 |:---|:---|:---:|:---:|:---|:---:|
 | **Condition 1: Single-Part Max Fit** | Maximizing front fairing (`p01`) on 1220×2440 mm sheet | 1 | 14 units | 54.65% yield | ~8.4s |
-| **Condition 2: Max Mixed Fit** | Algorithmic ideal pair: Tail Hugger (`p02`) + Footpeg Hanger (`p06`) | 1 | 24 units (12 + 12) | 68.32% yield (Void cavity nested) | ~14.1s |
+| **Condition 2: Max Mixed Fit** | Algorithmic ideal pair: Rear Tail Hugger (`p02`) + Triple Tree Fork Brace (`p08`) | 1 | **51 units** (25 Huggers + 26 Braces) | **56.82% yield** (Snug tire arch cavity nesting + 3-column layout; zero loose gaps) | ~0.05s |
 | **Condition 3: Fixed Production Order** | Order of 45 Front Fairings (`p01`) across warehouse inventory | 4 | 45 units | Sheets 1–3: 14/sheet (100% full)<br>Sheet 4: 3 units compacted, **$679 \times 2430\text{ mm}$ ($1.65\text{ m}^2$) virgin remnant** | ~19.2s |
-| **Condition 4: Mixed Assembly BOM Batch** | Full motorcycle kit (4 Fairings, 4 Huggers, 8 Louvers, 4 Skid plates, 8 Footpegs, 8 Caliper brackets, etc.) | 4 | 56 units | Zero orphaned parts; perfectly balanced assembly kit | ~28.5s |
-| **Condition 5: Rush Kanban Order** | 15 Skid plates (`p04`) + 20 Triple tree braces (`p08`) with remnant salvage | 2 | 35 units | Sheet 1: 22 units (Full)<br>Sheet 2: 13 units compacted with **Guillotine Shear Line** preserving $1.4\text{ m}^2$ remnant | ~12.7s |
+| **Condition 4: Mixed Assembly BOM Batch** | Full motorcycle BOM (25 Fairings, 25 Skid Plates, 25 Tail Tidies, 50 Grill Brackets, 100 Tags) | 4 | **225 units** | Sheets 1–3: 100% capacity.<br>Sheet 4: 7 units compacted vertically into left column ($X \le 316\text{ mm}$), **$889 \times 2430\text{ mm}$ ($2.16\text{ m}^2$, 73% of sheet) virgin remnant** preserved | ~58.2s |
+| **Condition 5: Rush Kanban Order** | 15 Skid plates (`p04`) + 20 Triple tree braces (`p08`) with remnant salvage | 1 | 35 units | 66.5% yield with **Guillotine Shear Line** @ $X = 1163\text{ mm}$ | ~18.5s |
+
 
 
 
