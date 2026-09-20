@@ -609,6 +609,234 @@ class MultiSheetBatchPlanner:
 
         return records
 
+    def run_fill_order(
+        self,
+        primary_part_name: str,
+        primary_qty_mode: str = "max_fit",  # "max_fit" or "custom"
+        primary_qty: int = 10,
+        filler_part_name: str = "",
+        max_filler_qty: Optional[int] = None,
+        named_parts: Optional[List[Tuple[str, IsolatedObject]]] = None,
+        output_prefix: str = "fill_batch"
+    ) -> SheetNestingRecord:
+        """
+        Executes a High-Density Fill Nesting Job:
+        - Step 1: Packs the primary product (either Max Fit full sheet or Custom Quantity).
+        - Step 2: Identifies all unoccupied spaces (internal concave cavities, gaps, corners, and open plate area).
+        - Step 3: Opportunistically fills every gap with the secondary filler product.
+        - Step 4: Produces a production sheet SVG with dual-color palette and utilization gain audit.
+        """
+        scale = 100.0
+        sheet_w = self.sheet_w_mm * scale
+        sheet_h = self.sheet_h_mm * scale
+        margin = self.margin_mm * scale
+        kerf = self.kerf_mm * scale
+
+        part_dict = dict(named_parts)
+        primary_obj = part_dict[primary_part_name]
+        filler_obj = part_dict[filler_part_name]
+
+        print("\n" + "=" * 80)
+        print(f"       STARTING PRIMARY + FILLER NESTING SOLVER: {output_prefix.upper()}")
+        print("=" * 80)
+        print(f"  Primary Product SKU   : {primary_part_name} ({primary_qty_mode.upper()}: {primary_qty if primary_qty_mode == 'custom' else 'Full Plate'})")
+        print(f"  Secondary Filler SKU  : {filler_part_name} (Opportunistic Void & Gap Fill)")
+        print(f"  Raw Sheet Dimension   : {self.sheet_w_mm:.1f} x {self.sheet_h_mm:.1f} mm | Kerf: {self.kerf_mm:.1f} mm")
+        print("-" * 80)
+
+        # 1. Place Primary Parts
+        if primary_qty_mode == "max_fit":
+            engine = IndustrialNestingEngine(
+                sheet_w_mm=self.sheet_w_mm,
+                sheet_h_mm=self.sheet_h_mm,
+                kerf_mm=self.kerf_mm,
+                margin_mm=self.margin_mm,
+                allowed_angles=[0.0, 90.0, 180.0, 270.0],
+                sheet_cost_usd=self.sheet_cost_usd,
+                machine_hourly_rate_usd=self.machine_hourly_rate_usd,
+                material_type=self.material_type,
+                jev_advisor=self.jev_advisor
+            )
+            res = engine.optimize_multi_part_nesting([(primary_part_name, primary_obj)])
+            primary_placed = [
+                PlacedInstance(part_index=0, angle=p.angle, x=p.x, y=p.y, polygon=p.polygon, buffered_polygon=p.buffered_polygon)
+                for p in res.parts_placed
+            ]
+        else:
+            items_prim = [(0, primary_part_name, primary_obj)] * primary_qty
+            comp_res = self.pack_directional_compaction(items_prim, strategy=self.packing_strategy or "auto")
+            if comp_res and len(comp_res[0]) == primary_qty:
+                primary_placed = comp_res[0]
+            else:
+                engine = IndustrialNestingEngine(
+                    sheet_w_mm=self.sheet_w_mm,
+                    sheet_h_mm=self.sheet_h_mm,
+                    kerf_mm=self.kerf_mm,
+                    margin_mm=self.margin_mm,
+                    allowed_angles=[0.0, 90.0, 180.0, 270.0],
+                    sheet_cost_usd=self.sheet_cost_usd,
+                    machine_hourly_rate_usd=self.machine_hourly_rate_usd,
+                    material_type=self.material_type,
+                    jev_advisor=self.jev_advisor
+                )
+                res = engine.optimize_multi_part_nesting([(primary_part_name, primary_obj)])
+                primary_placed = [
+                    PlacedInstance(part_index=0, angle=p.angle, x=p.x, y=p.y, polygon=p.polygon, buffered_polygon=p.buffered_polygon)
+                    for p in res.parts_placed[:primary_qty]
+                ]
+
+        print(f"[*] Step 1 Complete: Placed {len(primary_placed)} units of Primary '{primary_part_name}'")
+
+        placed_instances: List[PlacedInstance] = list(primary_placed)
+        placed_bufs: List[Polygon] = [p.buffered_polygon for p in placed_instances]
+
+        # 2. Host Cavity Containment Precomputation
+        cavity_offsets = {}
+        for h_ang in [0.0, 90.0, 180.0, 270.0]:
+            h_prot = affinity.rotate(primary_obj.outer_path.polygon, h_ang, origin='center')
+            mnx, mny, mxx, mxy = h_prot.bounds
+            h_norm = affinity.translate(h_prot, -mnx, -mny)
+            c_rot = check_physical_cavity_containment(h_norm, filler_obj.outer_path.polygon, kerf=kerf)
+            if c_rot:
+                cavity_offsets[h_ang] = c_rot
+
+        poly_guest = filler_obj.outer_path.polygon
+        tree = STRtree(placed_bufs)
+        cavity_fillers_count = 0
+
+        # Inject into cavities
+        for p in primary_placed:
+            if max_filler_qty and (len(placed_instances) - len(primary_placed)) >= max_filler_qty:
+                break
+            ang_key = round(p.angle % 360, 1)
+            if ang_key in cavity_offsets:
+                vx, vy, vang = cavity_offsets[ang_key]
+                prot = affinity.rotate(poly_guest, vang, origin='center')
+                mnx, mny, mxx, mxy = prot.bounds
+                p_norm = affinity.translate(prot, -mnx, -mny)
+                cand_p = affinity.translate(p_norm, p.x + vx, p.y + vy)
+                cand_b = cand_p.buffer(kerf / 2.0)
+                hits = tree.query(cand_b)
+                if not any(cand_b.intersection(placed_bufs[h]).area > 1.0 for h in hits):
+                    inst = PlacedInstance(part_index=1, angle=vang, x=p.x + vx, y=p.y + vy, polygon=cand_p, buffered_polygon=cand_b)
+                    placed_instances.append(inst)
+                    placed_bufs.append(cand_b)
+                    tree = STRtree(placed_bufs)
+                    cavity_fillers_count += 1
+
+        if cavity_fillers_count > 0:
+            print(f"[*] Step 2 Complete: Injected {cavity_fillers_count} Filler parts directly inside Primary cavity voids!")
+        else:
+            print("[*] Step 2 Complete: No physical cavity containment fit detected for host-guest geometry.")
+
+        # 3. Interstitial Gap & Open Plate In-Filling
+        open_fillers_count = 0
+        for angle in [0.0, 90.0, 180.0, 270.0]:
+            if max_filler_qty and (len(placed_instances) - len(primary_placed)) >= max_filler_qty:
+                break
+            prot = affinity.rotate(poly_guest, angle, origin='center')
+            mnx, mny, mxx, mxy = prot.bounds
+            p_norm = affinity.translate(prot, -mnx, -mny)
+            pw, ph = mxx - mnx, mxy - mny
+
+            cand_xs = sorted(list(set(
+                [margin] +
+                [p.polygon.bounds[0] for p in placed_instances] +
+                [p.polygon.bounds[2] + kerf for p in placed_instances] +
+                list(np.arange(margin, sheet_w - pw - margin, max(pw, 5000.0)))
+            )))
+            cand_ys = sorted(list(set(
+                [margin] +
+                [p.polygon.bounds[1] for p in placed_instances] +
+                [p.polygon.bounds[3] + kerf for p in placed_instances] +
+                list(np.arange(margin, sheet_h - ph - margin, max(ph, 5000.0)))
+            )))
+
+            cand_xs = [x for x in cand_xs if margin <= x <= sheet_w - margin - pw]
+            cand_ys = [y for y in cand_ys if margin <= y <= sheet_h - margin - ph]
+
+            b_norm = p_norm.buffer(kerf / 2.0)
+            for cy in cand_ys:
+                if max_filler_qty and (len(placed_instances) - len(primary_placed)) >= max_filler_qty:
+                    break
+                last_placed_x = -1e9
+                for cx in cand_xs:
+                    if cx < last_placed_x + pw + kerf - 1.0:
+                        continue
+                    if max_filler_qty and (len(placed_instances) - len(primary_placed)) >= max_filler_qty:
+                        break
+                    cand_b = affinity.translate(b_norm, cx, cy)
+                    hits = tree.query(cand_b)
+                    if any(cand_b.intersection(placed_bufs[h]).area > 1.0 for h in hits):
+                        continue
+                    cand_p = affinity.translate(p_norm, cx, cy)
+                    inst = PlacedInstance(part_index=1, angle=angle, x=cx, y=cy, polygon=cand_p, buffered_polygon=cand_b)
+                    placed_instances.append(inst)
+                    placed_bufs.append(cand_b)
+                    tree = STRtree(placed_bufs)
+                    open_fillers_count += 1
+                    last_placed_x = cx
+
+        total_fillers = cavity_fillers_count + open_fillers_count
+        print(f"[*] Step 3 Complete: Packed {open_fillers_count} additional Filler parts into corridors & plate remnants.")
+
+        # 4. Metrics & Yield Calculations
+        sheet_area_cm2 = (self.sheet_w_mm * self.sheet_h_mm) / 100.0
+        prim_area_cm2 = len(primary_placed) * primary_obj.outer_path.polygon.area / (scale ** 2) / 100.0
+        fill_area_cm2 = total_fillers * filler_obj.outer_path.polygon.area / (scale ** 2) / 100.0
+        base_yield_pct = (prim_area_cm2 / sheet_area_cm2) * 100.0 if sheet_area_cm2 > 0 else 0.0
+        boosted_yield_pct = ((prim_area_cm2 + fill_area_cm2) / sheet_area_cm2) * 100.0 if sheet_area_cm2 > 0 else 0.0
+        gain_pct = boosted_yield_pct - base_yield_pct
+
+        print("\n" + "=" * 80)
+        print(f"       FILL NESTING RESULTS & MONETIZATION AUDIT")
+        print("=" * 80)
+        print(f"  Primary '{primary_part_name}' Produced : {len(primary_placed)} units")
+        print(f"  Filler  '{filler_part_name}' Produced  : {total_fillers} units ({cavity_fillers_count} cavity + {open_fillers_count} gap)")
+        print(f"  Baseline Material Yield (Primary Only) : {base_yield_pct:.1f}%")
+        print(f"  Boosted Material Yield (With Fillers)  : {boosted_yield_pct:.1f}% (+{gain_pct:.1f}% GAIN!)")
+        print("=" * 80 + "\n")
+
+        fill_info = {
+            'is_fill': True,
+            'primary_name': primary_part_name,
+            'primary_count': len(primary_placed),
+            'filler_name': filler_part_name,
+            'filler_count': total_fillers,
+            'cavity_count': cavity_fillers_count,
+            'gap_count': open_fillers_count,
+            'baseline_yield': base_yield_pct,
+            'boosted_yield': boosted_yield_pct,
+            'gain': gain_pct
+        }
+
+        # 5. Generate Sheet SVG
+        os.makedirs("output", exist_ok=True)
+        sheet_svg_path = os.path.join("output", f"{output_prefix}_sheet_1.svg")
+        named_fill_parts = [(primary_part_name, primary_obj), (filler_part_name, filler_obj)]
+
+        self._write_batch_sheet_svg(
+            sheet_placed=placed_instances,
+            named_parts=named_fill_parts,
+            guillotine_cut_x=None,
+            guillotine_cut_y=None,
+            remnant_dims=None,
+            output_path=sheet_svg_path,
+            sheet_idx=1,
+            fill_info=fill_info
+        )
+
+        return SheetNestingRecord(
+            sheet_index=1,
+            parts_placed=placed_instances,
+            total_parts=len(placed_instances),
+            part_counts={primary_part_name: len(primary_placed), filler_part_name: total_fillers},
+            utilization_pct=boosted_yield_pct,
+            scrap_pct=100.0 - boosted_yield_pct,
+            is_partial_sheet=False,
+            output_svg_path=sheet_svg_path
+        )
+
     def _write_batch_sheet_svg(
         self,
         sheet_placed: List[PlacedInstance],
@@ -617,7 +845,8 @@ class MultiSheetBatchPlanner:
         guillotine_cut_y: Optional[float] = None,
         remnant_dims: Optional[Tuple[float, float]] = None,
         output_path: str = "output/sheet.svg",
-        sheet_idx: int = 1
+        sheet_idx: int = 1,
+        fill_info: Optional[Dict[str, Any]] = None
     ):
         """Generate SVG with highlighted guillotine shear line (horizontal or vertical) and remnant zone."""
         scale = 100.0
@@ -627,8 +856,8 @@ class MultiSheetBatchPlanner:
 
         palettes = [
             ("#3b82f6", "#1e3a8a", 0.40),
+            ("#10b981", "#047857", 0.45),
             ("#06b6d4", "#0891b2", 0.40),
-            ("#10b981", "#047857", 0.40),
             ("#f59e0b", "#b45309", 0.40),
             ("#8b5cf6", "#6d28d9", 0.40),
             ("#ec4899", "#be185d", 0.40)
@@ -648,12 +877,29 @@ class MultiSheetBatchPlanner:
             '      .guillotine-label { font-family: sans-serif; font-size: 260px; font-weight: bold; fill: #dc2626; }',
             '      .remnant-label { font-family: sans-serif; font-size: 220px; font-weight: bold; fill: #ca8a04; }',
             '      .part-label { font-family: sans-serif; font-size: 130px; font-weight: bold; fill: #0f172a; }',
+            '      .filler-label { font-family: sans-serif; font-size: 120px; font-weight: bold; fill: #064e3b; }',
             '    </style>',
             '  </defs>',
             f'  <!-- Sheet Material Base ({self.sheet_w_mm:.1f} x {self.sheet_h_mm:.1f} mm) -->',
             f'  <rect class="sheet-border" x="0" y="0" width="{sheet_w:.1f}" height="{sheet_h:.1f}" />',
             f'  <rect class="usable-boundary" x="{margin:.1f}" y="{margin:.1f}" width="{sheet_w - 2*margin:.1f}" height="{sheet_h - 2*margin:.1f}" />'
         ]
+
+        # Draw Fill Mode Header Banner if present
+        if fill_info:
+            p_n = fill_info.get('primary_name', 'Primary')
+            f_n = fill_info.get('filler_name', 'Filler')
+            p_cnt = fill_info.get('primary_count', 0)
+            f_cnt = fill_info.get('filler_count', 0)
+            b_yd = fill_info.get('baseline_yield', 0.0)
+            boost_yd = fill_info.get('boosted_yield', 0.0)
+            gain = fill_info.get('gain', 0.0)
+
+            svg_lines.append('  <!-- FILL MODE HEADER BANNER -->')
+            svg_lines.append(f'  <rect x="{margin:.1f}" y="{margin:.1f}" width="{sheet_w - 2*margin:.1f}" height="2800" rx="150" fill="#0f172a" fill-opacity="0.94" />')
+            svg_lines.append(f'  <text x="{margin + 500:.1f}" y="{margin + 1700:.1f}" font-family="sans-serif" font-size="280px" font-weight="bold" fill="#38bdf8">⚡ EASYNEST FILL MODE</text>')
+            svg_lines.append(f'  <text x="{margin + 4800:.1f}" y="{margin + 1700:.1f}" font-family="sans-serif" font-size="220px" font-weight="bold" fill="#f8fafc">PRIMARY: {p_n} ({p_cnt})  |  FILLER: {f_n} ({f_cnt})</text>')
+            svg_lines.append(f'  <text x="{sheet_w - margin - 500:.1f}" y="{margin + 1700:.1f}" text-anchor="end" font-family="sans-serif" font-size="240px" font-weight="bold" fill="#4ade80">YIELD: {b_yd:.1f}% → {boost_yd:.1f}% (+{gain:.1f}% GAIN)</text>')
 
         # Draw Remnant Box & Guillotine Line if present
         if guillotine_cut_y is not None and remnant_dims is not None:
@@ -684,6 +930,8 @@ class MultiSheetBatchPlanner:
             svg_lines.append(f'  <text x="{rem_x + rem_w/2.0:.1f}" y="{rem_y + rem_h/2.0:.1f}" text-anchor="middle" class="remnant-label">REUSABLE VIRGIN REMNANT ({rem_w_mm:.0f} x {rem_h_mm:.0f} mm)</text>')
 
         # Draw Placed Parts
+        prim_c = 0
+        fill_c = 0
         for idx, inst in enumerate(sheet_placed, 1):
             p_name, p_obj = named_parts[inst.part_index]
             angle = inst.angle
@@ -717,11 +965,26 @@ class MultiSheetBatchPlanner:
             if t_holes:
                 compound_d += ' ' + ' '.join(h.to_svg_d() for h in t_holes)
 
-            col = palettes[inst.part_index % len(palettes)]
+            if fill_info:
+                if inst.part_index == 0:
+                    prim_c += 1
+                    col = ("#3b82f6", "#1e3a8a", 0.40)
+                    label_text = f"P{prim_c}"
+                    label_cls = "part-label"
+                else:
+                    fill_c += 1
+                    col = ("#10b981", "#047857", 0.45)
+                    label_text = f"F{fill_c}"
+                    label_cls = "filler-label"
+            else:
+                col = palettes[inst.part_index % len(palettes)]
+                label_text = f"#{idx}"
+                label_cls = "part-label"
+
             svg_lines.append(
                 f'  <g id="sheet{sheet_idx}_part_{idx}" class="nested-part" data-part="{p_name}">'
                 f'    <path fill="{col[0]}" fill-opacity="{col[2]}" stroke="{col[1]}" stroke-width="25" fill-rule="evenodd" d="{compound_d}" />'
-                f'    <text x="{inst.polygon.centroid.x:.1f}" y="{inst.polygon.centroid.y:.1f}" text-anchor="middle" dominant-baseline="central" class="part-label">#{idx}</text>'
+                f'    <text x="{inst.polygon.centroid.x:.1f}" y="{inst.polygon.centroid.y:.1f}" text-anchor="middle" dominant-baseline="central" class="{label_cls}">{label_text}</text>'
                 f'  </g>'
             )
 

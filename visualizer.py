@@ -19,6 +19,7 @@ import json
 import time
 import socket
 import socketserver
+import threading
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 from typing import Dict, Any, List, Optional, Tuple
@@ -139,6 +140,23 @@ def parse_sheet_metadata(svg_path: str) -> Dict[str, Any]:
     remnant_match = re.search(r'REUSABLE VIRGIN REMNANT\s*\(([^\)]+)\)', content)
     remnant_dims = remnant_match.group(1).strip() if remnant_match else None
 
+    # Fill mode detection
+    is_fill = ("FILL MODE" in content or "EASYNEST FILL MODE" in content or "filler-label" in content)
+    fill_info = None
+    if is_fill:
+        fill_banner_match = re.search(r'PRIMARY:\s*([^\s\(]+)\s*\((\d+)\)\s*\|\s*FILLER:\s*([^\s\(]+)\s*\((\d+)\)', content)
+        yield_boost_match = re.search(r'YIELD:\s*([0-9.]+)%\s*→\s*([0-9.]+)%\s*\(\+([0-9.]+)%\s*GAIN\)', content)
+        if fill_banner_match and yield_boost_match:
+            fill_info = {
+                "primary_name": fill_banner_match.group(1),
+                "primary_count": int(fill_banner_match.group(2)),
+                "filler_name": fill_banner_match.group(3),
+                "filler_count": int(fill_banner_match.group(4)),
+                "baseline_yield": float(yield_boost_match.group(1)),
+                "boosted_yield": float(yield_boost_match.group(2)),
+                "gain": float(yield_boost_match.group(3)),
+            }
+
     # Batch grouping logic
     # Look for batch pattern: <batch_prefix>_sheet_<N>.svg OR condX_...
     sheet_num = 1
@@ -160,7 +178,12 @@ def parse_sheet_metadata(svg_path: str) -> Dict[str, Any]:
         "cond4_assembly_bom": "Condition 4: Mixed Assembly BOM (225 Parts)",
         "cond5_rush_kanban": "Condition 5: Rush Kanban (35 Parts)"
     }
-    batch_title = friendly_batch_titles.get(batch_id, batch_id.replace("_", " ").title())
+    if batch_id in friendly_batch_titles:
+        batch_title = friendly_batch_titles[batch_id]
+    elif is_fill and fill_info:
+        batch_title = f"⚡ Fill: {fill_info['primary_name']} + {fill_info['filler_name']}"
+    else:
+        batch_title = batch_id.replace("_", " ").title()
 
     is_partial = (remnant_dims is not None) or ("PARTIAL" in content)
 
@@ -175,6 +198,8 @@ def parse_sheet_metadata(svg_path: str) -> Dict[str, Any]:
         "total_parts": len(parts),
         "part_counts": part_counts,
         "is_partial": is_partial,
+        "is_fill": is_fill,
+        "fill_info": fill_info,
         "cut_axis": cut_axis,
         "cut_pos_mm": cut_pos_mm,
         "cut_x_mm": cut_x_mm,
@@ -265,10 +290,12 @@ def execute_production_batch(
     # Generate preview PNG for partial sheet or first sheet if possible
     if records and records[-1].output_svg_path and os.path.exists(records[-1].output_svg_path):
         png_out = records[-1].output_svg_path.replace(".svg", "_preview.png")
-        try:
-            render_preview_png(records[-1].output_svg_path, png_out, dpi=90)
-        except Exception:
-            pass
+        def _render_bg(svg_p, png_p):
+            try:
+                render_preview_png(svg_p, png_p, dpi=90)
+            except Exception:
+                pass
+        threading.Thread(target=_render_bg, args=(records[-1].output_svg_path, png_out), daemon=True).start()
 
     # Build response summary
     total_parts = sum(r.total_parts for r in records)
@@ -282,6 +309,75 @@ def execute_production_batch(
         "total_parts_produced": total_parts,
         "sheets_count": len(records),
         "salvaged_remnant_m2": round(total_salvage_m2, 3),
+        "runtime_seconds": runtime_s
+    }
+
+
+def execute_fill_batch(
+    primary_part_name: str,
+    filler_part_name: str,
+    primary_mode: str = "max_fit",
+    primary_qty: Optional[int] = None,
+    batch_name: str = "",
+    sheet_w_mm: float = 1220.0,
+    sheet_h_mm: float = 2440.0,
+    kerf_mm: float = 2.0,
+    margin_mm: float = 5.0,
+    packing_strategy: str = "auto"
+) -> Dict[str, Any]:
+    """Executes MultiSheetBatchPlanner.run_fill_order() for primary + void filler nesting."""
+    from batch_nest import MultiSheetBatchPlanner
+    from cdr_enhancer import render_preview_png
+
+    named_parts = get_named_parts()
+    valid_part_names = {name for name, _ in named_parts}
+    if primary_part_name not in valid_part_names:
+        raise ValueError(f"Primary part '{primary_part_name}' not found in catalogue.")
+    if filler_part_name not in valid_part_names:
+        raise ValueError(f"Filler part '{filler_part_name}' not found in catalogue.")
+
+    safe_slug = re.sub(r'[^a-zA-Z0-9_-]', '_', batch_name.strip())
+    if not safe_slug:
+        safe_slug = f"fill_{primary_part_name}_{filler_part_name}_{int(time.time())}"
+
+    planner = MultiSheetBatchPlanner(
+        sheet_w_mm=sheet_w_mm,
+        sheet_h_mm=sheet_h_mm,
+        kerf_mm=kerf_mm,
+        margin_mm=margin_mm,
+        packing_strategy=packing_strategy
+    )
+
+    t0 = time.time()
+    record = planner.run_fill_order(
+        primary_part_name=primary_part_name,
+        filler_part_name=filler_part_name,
+        named_parts=named_parts,
+        primary_qty_mode=primary_mode,
+        primary_qty=(primary_qty or 10),
+        output_prefix=safe_slug
+    )
+    runtime_s = round(time.time() - t0, 2)
+
+    if record and record.output_svg_path and os.path.exists(record.output_svg_path):
+        png_out = record.output_svg_path.replace(".svg", "_preview.png")
+        def _render_fill_bg(svg_p, png_p):
+            try:
+                render_preview_png(svg_p, png_p, dpi=90)
+            except Exception:
+                pass
+        threading.Thread(target=_render_fill_bg, args=(record.output_svg_path, png_out), daemon=True).start()
+
+    return {
+        "success": True,
+        "batch_id": safe_slug,
+        "batch_title": f"⚡ Fill: {primary_part_name} + {filler_part_name}",
+        "total_parts": record.total_parts,
+        "parts_breakdown": record.part_counts,
+        "yield_pct": record.utilization_pct,
+        "scrap_pct": record.scrap_pct,
+        "sheet_svg_path": record.output_svg_path,
+        "svg_filename": os.path.basename(record.output_svg_path) if record.output_svg_path else None,
         "runtime_seconds": runtime_s
     }
 
@@ -547,6 +643,106 @@ HTML_PAGE = r"""<!DOCTYPE html>
       display: flex;
       align-items: center;
       gap: 0.5rem;
+    }
+
+    /* Studio Mode Switcher */
+    .studio-mode-switcher {
+      display: flex;
+      background: #111827;
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      padding: 4px;
+      gap: 6px;
+      max-width: 580px;
+    }
+    .mode-tab-btn {
+      flex: 1;
+      background: transparent;
+      border: none;
+      color: var(--text-dim);
+      font-size: 0.88rem;
+      font-weight: 600;
+      padding: 0.55rem 1.1rem;
+      border-radius: 6px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0.5rem;
+      transition: all 0.15s ease;
+    }
+    .mode-tab-btn:hover { color: var(--text); background: #1e293b; }
+    .mode-tab-btn.active {
+      background: #0284c7;
+      color: white;
+      box-shadow: 0 2px 8px rgba(2, 132, 199, 0.4);
+    }
+    .mode-tab-btn.mode-fill.active {
+      background: linear-gradient(135deg, #059669, #0d9488);
+      box-shadow: 0 2px 10px rgba(5, 150, 105, 0.4);
+    }
+
+    /* Fill Card Styles */
+    .fill-preview-comparison {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1.25rem;
+      margin-top: 0.5rem;
+    }
+    .fill-compare-card {
+      background: #0d1322;
+      border: 1px solid #1f2937;
+      border-radius: 8px;
+      padding: 1rem;
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+    }
+    .fill-compare-thumb {
+      width: 80px;
+      height: 80px;
+      background: #ffffff;
+      border-radius: 6px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0.35rem;
+      flex-shrink: 0;
+    }
+    .fill-compare-thumb img {
+      max-width: 100%;
+      max-height: 100%;
+      object-fit: contain;
+    }
+    .fill-compare-info {
+      display: flex;
+      flex-direction: column;
+      gap: 0.25rem;
+    }
+    .fill-compare-badge {
+      font-size: 0.7rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      padding: 0.15rem 0.45rem;
+      border-radius: 4px;
+      display: inline-block;
+      width: fit-content;
+    }
+    .fill-badge-primary { background: rgba(59, 130, 246, 0.2); color: #60a5fa; border: 1px solid rgba(59, 130, 246, 0.4); }
+    .fill-badge-filler { background: rgba(16, 185, 129, 0.2); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.4); }
+
+    .badge-fill-stats {
+      background: rgba(16, 185, 129, 0.16);
+      color: #34d399;
+      border: 1px solid rgba(16, 185, 129, 0.35);
+      font-size: 0.75rem;
+      font-weight: 700;
+      padding: 0.25rem 0.6rem;
+      border-radius: 6px;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      white-space: nowrap;
     }
 
     /* Batch Action Banner */
@@ -1012,6 +1208,19 @@ HTML_PAGE = r"""<!DOCTYPE html>
        ======================================================================= -->
   <div id="view-studio" class="view-container studio-layout active">
 
+    <!-- Studio Mode Switcher: Standard Batch vs Void Fill Mode -->
+    <div class="studio-mode-switcher">
+      <button id="mode-tab-batch" class="mode-tab-btn active" onclick="switchStudioMode('batch')">
+        <span>📦</span> Standard Multi-Sheet Batch
+      </button>
+      <button id="mode-tab-fill" class="mode-tab-btn mode-fill" onclick="switchStudioMode('fill')">
+        <span>⚡</span> Void Fill Mode (Primary + Filler)
+      </button>
+    </div>
+
+    <!-- Mode 1: Standard Batch Container -->
+    <div id="studio-mode-batch-container" style="display: flex; flex-direction: column; gap: 1.25rem;">
+
     <!-- Batch Configuration Form -->
     <div class="config-card">
       <div class="config-header">
@@ -1115,6 +1324,131 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <!-- Rendered dynamically -->
       </div>
     </div>
+    </div> <!-- /studio-mode-batch-container -->
+
+    <!-- Mode 2: Fill Nesting Container -->
+    <div id="studio-mode-fill-container" style="display: none; flex-direction: column; gap: 1.25rem;">
+      <!-- Fill Configuration Card -->
+      <div class="config-card">
+        <div class="config-header">
+          <div class="config-title">
+            <span>⚡</span> Primary + Void Filler Nesting Engine
+          </div>
+          <div class="preset-pills">
+            <span style="font-size: 0.75rem; color: var(--text-dim); margin-right: 4px;">Fill Presets:</span>
+            <button class="preset-btn" onclick="applyFillPreset('cavity_demo')">🏍️ Tail Hugger + Fork Brace (Cavity)</button>
+            <button class="preset-btn" onclick="applyFillPreset('dense_void')">🛡️ Skid Plate + Gusset Tag (Dense)</button>
+            <button class="preset-btn" onclick="applyFillPreset('corridor_pack')">🏁 Tail Hugger + Sprocket Cover</button>
+          </div>
+        </div>
+
+        <div class="config-grid">
+          <!-- Fill Batch Identifier -->
+          <div class="input-group">
+            <label class="input-label" for="fill-input-batch-name">Fill Batch Identifier</label>
+            <input id="fill-input-batch-name" class="form-control" type="text" placeholder="e.g. fill_hugger_brace_01" />
+          </div>
+
+          <!-- Primary Component SKU -->
+          <div class="input-group">
+            <label class="input-label" for="fill-primary-sku">Primary Product (Base Host Part)</label>
+            <select id="fill-primary-sku" class="form-control" onchange="onFillPartChange()">
+              <!-- Populated via JS -->
+            </select>
+          </div>
+
+          <!-- Primary Quantity Mode -->
+          <div class="input-group">
+            <label class="input-label" for="fill-primary-mode">Primary Product Allocation</label>
+            <select id="fill-primary-mode" class="form-control" onchange="onFillModeChange()">
+              <option value="max_fit" selected>Max Fit (Exhaust Full Sheet First)</option>
+              <option value="custom">Custom Fixed Quantity</option>
+            </select>
+          </div>
+
+          <!-- Custom Primary Quantity (only when custom) -->
+          <div id="fill-custom-qty-box" class="input-group" style="display: none;">
+            <label class="input-label" for="fill-primary-qty">Primary Target Quantity</label>
+            <input id="fill-primary-qty" class="form-control" type="number" value="12" min="1" max="500" />
+          </div>
+
+          <!-- Secondary Filler Component SKU -->
+          <div class="input-group">
+            <label class="input-label" for="fill-filler-sku">Secondary Filler (Void & Corridors)</label>
+            <select id="fill-filler-sku" class="form-control" onchange="onFillPartChange()">
+              <!-- Populated via JS -->
+            </select>
+          </div>
+
+          <!-- Sheet Size Preset -->
+          <div class="input-group">
+            <label class="input-label" for="fill-select-sheet-size">Sheet Size Preset</label>
+            <select id="fill-select-sheet-size" class="form-control" onchange="onFillSheetSizeChange()">
+              <option value="1220x2440" selected>Standard Industrial: 1220 × 2440 mm (4×8 ft)</option>
+              <option value="1000x2000">Standard Metric: 1000 × 2000 mm (1×2 m)</option>
+              <option value="1220x1220">Square Half-Sheet: 1220 × 1220 mm (4×4 ft)</option>
+              <option value="600x1200">Compact Router Bed: 600 × 1200 mm</option>
+            </select>
+          </div>
+
+          <!-- Tool Kerf & Margin -->
+          <div class="input-group">
+            <label class="input-label" for="fill-input-kerf">Tool Cutting Kerf (mm)</label>
+            <input id="fill-input-kerf" class="form-control" type="number" value="2.0" step="0.5" min="0.5" max="20.0" />
+          </div>
+
+          <div class="input-group">
+            <label class="input-label" for="fill-input-margin">Sheet Border Margin (mm)</label>
+            <input id="fill-input-margin" class="form-control" type="number" value="5.0" step="1.0" min="0.0" max="50.0" />
+          </div>
+        </div>
+
+        <!-- Part Previews Comparison -->
+        <div class="fill-preview-comparison">
+          <div class="fill-compare-card">
+            <div class="fill-compare-thumb">
+              <img id="fill-preview-primary-img" src="" alt="Primary Part" />
+            </div>
+            <div class="fill-compare-info">
+              <span class="fill-compare-badge fill-badge-primary">PRIMARY BASE PART</span>
+              <div id="fill-preview-primary-title" style="font-weight: 700; font-size: 0.95rem; color: #f9fafb;">-</div>
+              <div id="fill-preview-primary-dims" style="font-size: 0.8rem; color: var(--text-dim); font-family: var(--font-mono);">-</div>
+              <div style="font-size: 0.75rem; color: #93c5fd; margin-top: 4px;">Rendered in Blue (#3b82f6), labeled P1..Pn</div>
+            </div>
+          </div>
+
+          <div class="fill-compare-card">
+            <div class="fill-compare-thumb">
+              <img id="fill-preview-filler-img" src="" alt="Filler Part" />
+            </div>
+            <div class="fill-compare-info">
+              <span class="fill-compare-badge fill-badge-filler">SECONDARY VOID FILLER</span>
+              <div id="fill-preview-filler-title" style="font-weight: 700; font-size: 0.95rem; color: #f9fafb;">-</div>
+              <div id="fill-preview-filler-dims" style="font-size: 0.8rem; color: var(--text-dim); font-family: var(--font-mono);">-</div>
+              <div style="font-size: 0.75rem; color: #6ee7b7; margin-top: 4px;">Rendered in Emerald (#10b981), labeled F1..Fn</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Fill Action Banner -->
+      <div class="action-banner" style="border-color: #059669; background: linear-gradient(90deg, #092019, #0c2d24);">
+        <div class="banner-stats">
+          <div class="banner-stat-item">
+            <span class="banner-stat-num" style="color: #34d399;">3-Phase</span>
+            <span class="banner-stat-label">Nesting Pipeline</span>
+          </div>
+          <div class="banner-stat-item">
+            <span class="banner-stat-num" style="font-size: 0.95rem; color: #a7f3d0;">1. Primary Layout → 2. Concave Cavity Injection → 3. Open Remnant Corridors</span>
+            <span class="banner-stat-label">Guaranteed 0 Collisions & Maximum Sheet Saturation</span>
+          </div>
+        </div>
+
+        <button id="btn-process-fill" class="btn btn-emerald" style="padding: 0.75rem 2rem; font-size: 1rem; background: #059669;" onclick="processFill()">
+          <span>⚡</span> RUN FILL NESTING
+        </button>
+      </div>
+    </div>
 
   </div>
 
@@ -1144,6 +1478,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <span id="sheet-nav-label" class="sheet-counter-badge">Sheet 1 of 1</span>
         <button class="btn btn-sm" onclick="nextSheet()" title="Next Sheet (→)">Next ▶</button>
         <div id="top-remnant-pill" class="badge-remnant" style="display: none;"></div>
+        <div id="top-fill-pill" class="badge-fill-stats" style="display: none;"></div>
       </div>
 
       <div class="viewer-nav-right">
@@ -1237,6 +1572,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         const res = await fetch('/api/catalogue');
         catalogueData = await res.json();
         renderCatalogue();
+        populateFillSelects();
       } catch (err) {
         console.error('Failed to load catalogue:', err);
       }
@@ -1385,6 +1721,155 @@ HTML_PAGE = r"""<!DOCTYPE html>
     }
 
     // =========================================================================
+    // VOID FILL MODE JAVASCRIPT LOGIC
+    // =========================================================================
+
+    function switchStudioMode(mode) {
+      const isFill = (mode === 'fill');
+      document.getElementById('mode-tab-batch').classList.toggle('active', !isFill);
+      document.getElementById('mode-tab-fill').classList.toggle('active', isFill);
+      document.getElementById('studio-mode-batch-container').style.display = isFill ? 'none' : 'flex';
+      document.getElementById('studio-mode-fill-container').style.display = isFill ? 'flex' : 'none';
+    }
+
+    function populateFillSelects() {
+      const primSel = document.getElementById('fill-primary-sku');
+      const fillSel = document.getElementById('fill-filler-sku');
+      if (!primSel || !fillSel) return;
+
+      primSel.innerHTML = '';
+      fillSel.innerHTML = '';
+
+      catalogueData.forEach(item => {
+        const optP = document.createElement('option');
+        optP.value = item.id;
+        optP.textContent = `${item.title} (${item.width_mm} × ${item.height_mm} mm)`;
+        primSel.appendChild(optP);
+
+        const optF = document.createElement('option');
+        optF.value = item.id;
+        optF.textContent = `${item.title} (${item.width_mm} × ${item.height_mm} mm)`;
+        fillSel.appendChild(optF);
+      });
+
+      if (catalogueData.some(c => c.id === 'p02_rear_tail_hugger')) {
+        primSel.value = 'p02_rear_tail_hugger';
+      }
+      if (catalogueData.some(c => c.id === 'p08_triple_tree_fork_brace')) {
+        fillSel.value = 'p08_triple_tree_fork_brace';
+      }
+
+      onFillPartChange();
+    }
+
+    function onFillPartChange() {
+      const primId = document.getElementById('fill-primary-sku').value;
+      const fillId = document.getElementById('fill-filler-sku').value;
+
+      const pItem = catalogueData.find(c => c.id === primId);
+      const fItem = catalogueData.find(c => c.id === fillId);
+
+      if (pItem) {
+        document.getElementById('fill-preview-primary-img').src = pItem.svg_url;
+        document.getElementById('fill-preview-primary-title').textContent = pItem.title;
+        document.getElementById('fill-preview-primary-dims').textContent = `${pItem.width_mm} × ${pItem.height_mm} mm • ${pItem.tier}`;
+      }
+      if (fItem) {
+        document.getElementById('fill-preview-filler-img').src = fItem.svg_url;
+        document.getElementById('fill-preview-filler-title').textContent = fItem.title;
+        document.getElementById('fill-preview-filler-dims').textContent = `${fItem.width_mm} × ${fItem.height_mm} mm • ${fItem.tier}`;
+      }
+    }
+
+    function onFillModeChange() {
+      const mode = document.getElementById('fill-primary-mode').value;
+      const customBox = document.getElementById('fill-custom-qty-box');
+      customBox.style.display = (mode === 'custom') ? 'flex' : 'none';
+    }
+
+    function onFillSheetSizeChange() {
+      // Preset selection handles size
+    }
+
+    function applyFillPreset(key) {
+      if (key === 'cavity_demo') {
+        document.getElementById('fill-primary-sku').value = 'p02_rear_tail_hugger';
+        document.getElementById('fill-primary-mode').value = 'max_fit';
+        document.getElementById('fill-filler-sku').value = 'p08_triple_tree_fork_brace';
+        document.getElementById('fill-input-batch-name').value = 'fill_hugger_cavity_demo';
+      } else if (key === 'dense_void') {
+        document.getElementById('fill-primary-sku').value = 'p04_engine_skid_plate';
+        document.getElementById('fill-primary-mode').value = 'custom';
+        document.getElementById('fill-primary-qty').value = '12';
+        document.getElementById('fill-filler-sku').value = 'p12_frame_gusset_tag';
+        document.getElementById('fill-input-batch-name').value = 'fill_skid_dense_void';
+      } else if (key === 'corridor_pack') {
+        document.getElementById('fill-primary-sku').value = 'p02_rear_tail_hugger';
+        document.getElementById('fill-primary-mode').value = 'custom';
+        document.getElementById('fill-primary-qty').value = '16';
+        document.getElementById('fill-filler-sku').value = 'p07_sprocket_cover';
+        document.getElementById('fill-input-batch-name').value = 'fill_hugger_corridor_pack';
+      }
+      onFillModeChange();
+      onFillPartChange();
+    }
+
+    async function processFill() {
+      const primaryPart = document.getElementById('fill-primary-sku').value;
+      const fillerPart = document.getElementById('fill-filler-sku').value;
+      const primaryMode = document.getElementById('fill-primary-mode').value;
+      const primaryQty = (primaryMode === 'custom') ? (parseInt(document.getElementById('fill-primary-qty').value) || 12) : null;
+      const sheetSizeVal = document.getElementById('fill-select-sheet-size').value;
+      const parts = sheetSizeVal.split('x');
+      const sheetW = parseFloat(parts[0]) || 1220.0;
+      const sheetH = parseFloat(parts[1]) || 2440.0;
+      const kerf = parseFloat(document.getElementById('fill-input-kerf').value) || 2.0;
+      const margin = parseFloat(document.getElementById('fill-input-margin').value) || 5.0;
+
+      let batchName = document.getElementById('fill-input-batch-name').value.trim();
+      if (!batchName) {
+        batchName = `fill_${primaryPart}_${fillerPart}_${Date.now()}`;
+      }
+
+      const overlay = document.getElementById('progress-overlay');
+      overlay.style.display = 'flex';
+      document.getElementById('progress-text').textContent = `Running Void Fill Nesting: ${batchName}...`;
+      document.getElementById('progress-subtext').textContent = 'Phase 1: Primary Layout → Phase 2: Cavity Injection → Phase 3: Void Corridors...';
+
+      try {
+        const res = await fetch('/api/run_fill', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            primary_part_name: primaryPart,
+            filler_part_name: fillerPart,
+            primary_mode: primaryMode,
+            primary_qty: primaryQty,
+            batch_name: batchName,
+            sheet_w_mm: sheetW,
+            sheet_h_mm: sheetH,
+            kerf_mm: kerf,
+            margin_mm: margin,
+            packing_strategy: 'auto'
+          })
+        });
+
+        const result = await res.json();
+        overlay.style.display = 'none';
+
+        if (result.success) {
+          await loadBatches(result.batch_id);
+          switchView('viewer');
+        } else {
+          alert(`Fill nesting failed: ${result.error || 'Unknown error'}`);
+        }
+      } catch (err) {
+        overlay.style.display = 'none';
+        alert(`Error executing fill nesting: ${err.message}`);
+      }
+    }
+
+    // =========================================================================
     // NORMAL SHEET VIEWER LOGIC (NO DRAGGING)
     // =========================================================================
 
@@ -1452,12 +1937,24 @@ HTML_PAGE = r"""<!DOCTYPE html>
       document.getElementById('stat-total-parts').textContent = `${sheet.total_parts} parts`;
 
       const remnantPill = document.getElementById('top-remnant-pill');
+      const fillPill = document.getElementById('top-fill-pill');
+
+      if (sheet.is_fill && sheet.fill_info) {
+        const fi = sheet.fill_info;
+        if (fillPill) {
+          fillPill.style.display = 'inline-flex';
+          fillPill.innerHTML = `⚡ Yield: ${fi.baseline_yield.toFixed(1)}% → ${fi.boosted_yield.toFixed(1)}% (+${fi.gain.toFixed(1)}% Gain) • Prim: ${fi.primary_count} | Fill: ${fi.filler_count}`;
+        }
+      } else if (fillPill) {
+        fillPill.style.display = 'none';
+      }
+
       const axis = sheet.cut_axis ? sheet.cut_axis.toUpperCase() : (sheet.cut_y_mm ? 'Y' : 'X');
       const cutPos = sheet.cut_pos_mm || sheet.cut_y_mm || sheet.cut_x_mm;
-      if (cutPos && sheet.remnant_dims) {
+      if (!sheet.is_fill && cutPos && sheet.remnant_dims) {
         remnantPill.style.display = 'inline-flex';
         remnantPill.innerHTML = `✂ Shear Cut @ ${axis} = ${cutPos.toFixed(1)} mm • Remnant: ${sheet.remnant_dims}`;
-      } else if (cutPos) {
+      } else if (!sheet.is_fill && cutPos) {
         remnantPill.style.display = 'inline-flex';
         remnantPill.innerHTML = `✂ Shear Cut @ ${axis} = ${cutPos.toFixed(1)} mm`;
       } else {
@@ -1471,7 +1968,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
         const pill = document.createElement('div');
         pill.className = 'part-tag';
         pill.setAttribute('data-name', pname);
-        pill.innerHTML = `${pname}: <span>${count}</span>`;
+        if (sheet.is_fill && sheet.fill_info) {
+          const isPrim = (pname === sheet.fill_info.primary_name);
+          const isFill = (pname === sheet.fill_info.filler_name);
+          const prefix = isPrim ? '<span style="color:#60a5fa;font-weight:800;margin-right:2px;">[P]</span> ' : (isFill ? '<span style="color:#34d399;font-weight:800;margin-right:2px;">[F]</span> ' : '');
+          pill.innerHTML = `${prefix}${pname}: <span>${count}</span>`;
+          if (isPrim) pill.style.borderColor = 'rgba(59, 130, 246, 0.5)';
+          if (isFill) pill.style.borderColor = 'rgba(16, 185, 129, 0.5)';
+        } else {
+          pill.innerHTML = `${pname}: <span>${count}</span>`;
+        }
         pill.onclick = () => highlightPartsByName(pname);
         pillsContainer.appendChild(pill);
       }
@@ -1677,6 +2183,53 @@ class VisualizerRequestHandler(SimpleHTTPRequestHandler):
                 result = execute_production_batch(
                     batch_name=batch_name,
                     order=order,
+                    sheet_w_mm=sheet_w,
+                    sheet_h_mm=sheet_h,
+                    kerf_mm=kerf,
+                    margin_mm=margin,
+                    packing_strategy=packing_strategy
+                )
+
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(json.dumps(result).encode("utf-8"))
+
+            except Exception as e:
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": str(e)}).encode("utf-8"))
+            return
+
+        elif path == "/api/run_fill":
+            content_length = int(self.headers.get("Content-Length", 0))
+            body_bytes = self.rfile.read(content_length)
+            try:
+                data = json.loads(body_bytes.decode("utf-8"))
+                primary_part = data.get("primary_part_name", "")
+                filler_part = data.get("filler_part_name", "")
+                primary_mode = data.get("primary_mode", "max_fit")
+                primary_qty = data.get("primary_qty")
+                if primary_qty is not None and str(primary_qty).isdigit():
+                    primary_qty = int(primary_qty)
+                else:
+                    primary_qty = None
+                batch_name = data.get("batch_name", "")
+                sheet_w = float(data.get("sheet_w_mm", 1220.0))
+                sheet_h = float(data.get("sheet_h_mm", 2440.0))
+                kerf = float(data.get("kerf_mm", 2.0))
+                margin = float(data.get("margin_mm", 5.0))
+                packing_strategy = data.get("packing_strategy", "auto")
+
+                result = execute_fill_batch(
+                    primary_part_name=primary_part,
+                    filler_part_name=filler_part,
+                    primary_mode=primary_mode,
+                    primary_qty=primary_qty,
+                    batch_name=batch_name,
                     sheet_w_mm=sheet_w,
                     sheet_h_mm=sheet_h,
                     kerf_mm=kerf,
