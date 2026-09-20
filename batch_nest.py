@@ -213,7 +213,9 @@ class SheetNestingRecord:
     utilization_pct: float
     scrap_pct: float
     is_partial_sheet: bool
+    guillotine_cut_axis: Optional[str] = None  # 'x' (vertical shear) or 'y' (horizontal shear)
     guillotine_cut_x_mm: Optional[float] = None
+    guillotine_cut_y_mm: Optional[float] = None
     remnant_w_mm: Optional[float] = None
     remnant_h_mm: Optional[float] = None
     remnant_area_m2: Optional[float] = None
@@ -232,7 +234,8 @@ class MultiSheetBatchPlanner:
         sheet_cost_usd: float = 35.0,
         machine_hourly_rate_usd: float = 75.0,
         material_type: str = "3mm Cast Acrylic",
-        jev_advisor: Optional[JevNestingAdvisor] = None
+        jev_advisor: Optional[JevNestingAdvisor] = None,
+        packing_strategy: str = "auto"
     ):
         self.sheet_w_mm = sheet_w_mm
         self.sheet_h_mm = sheet_h_mm
@@ -242,75 +245,165 @@ class MultiSheetBatchPlanner:
         self.machine_hourly_rate_usd = machine_hourly_rate_usd
         self.material_type = material_type
         self.jev_advisor = jev_advisor
+        self.packing_strategy = packing_strategy
 
     def pack_directional_compaction(
         self,
-        items_to_pack: List[Tuple[int, str, IsolatedObject]]
-    ) -> List[PlacedInstance]:
+        items_to_pack: List[Tuple[int, str, IsolatedObject]],
+        strategy: Optional[str] = None
+    ) -> Optional[Tuple[List[PlacedInstance], str, float, Tuple[float, float]]]:
         """
-        Packs items strictly against the left edge (X_min), testing 4 orthogonal rotations
-        (0, 90, 180, 270 deg) and penalizing lateral width X_max to maximize virgin remnant stock.
+        Rational Compaction Engine (Operator Intelligence):
+        - Strategy 'auto': evaluates horizontal strip (top-row compaction) vs vertical strip (left-column compaction),
+          picking the orientation that maximizes certified reusable rectangular remnant stock.
+        - Strategy 'horizontal': packs along X first in clean rows, minimizing Y to leave a full-width remnant slab.
+        - Strategy 'vertical': packs along Y first in clean columns, minimizing X.
+        - Strategy 'compact': minimizes corner bounding envelope (X_max * Y_max).
+        - Anchoring: Uses precise unbuffered part coordinates + kerf clearance to eliminate checkerboard staggering.
+        - Collision: Uses 2D intersection area (> 0.0001 mm²) to avoid false collisions from touching kerf boundaries.
+        Returns: (placed_instances, cut_axis, cut_pos_mm, remnant_dims_mm) or None if items cannot fit.
         """
+        strat = strategy or self.packing_strategy or "auto"
         scale = 100.0
         sheet_w = self.sheet_w_mm * scale
         sheet_h = self.sheet_h_mm * scale
         margin = self.margin_mm * scale
         kerf = self.kerf_mm * scale
 
-        # Sort items by descending area (largest parts anchored first)
-        sorted_items = sorted(items_to_pack, key=lambda it: it[2].outer_path.polygon.area, reverse=True)
-        placed_instances: List[PlacedInstance] = []
-        placed_bufs: List[Polygon] = []
+        def solve_pass(cost_mode: str) -> Optional[List[PlacedInstance]]:
+            # Group identical parts together and sort by descending area
+            sorted_items = sorted(items_to_pack, key=lambda it: (it[2].outer_path.polygon.area, it[1]), reverse=True)
+            placed_instances: List[PlacedInstance] = []
+            placed_bufs: List[Polygon] = []
+            placed_bboxes: List[Tuple[float, float, float, float]] = []
 
-        for part_idx, name, obj in sorted_items:
-            poly = obj.outer_path.polygon
-            best_cand = None
-            best_cost = float('inf')
-            tree = STRtree(placed_bufs) if placed_bufs else None
+            for part_idx, name, obj in sorted_items:
+                poly = obj.outer_path.polygon
+                best_cand = None
+                best_cost = float('inf')
+                tree = STRtree(placed_bufs) if placed_bufs else None
 
-            cand_xs = [margin]
-            cand_ys = [margin]
-            for b in placed_bufs:
-                cand_xs.extend([b.bounds[0], b.bounds[2] + kerf / 2.0])
-                cand_ys.extend([b.bounds[1], b.bounds[3] + kerf / 2.0])
-            cand_xs = sorted(list(set(cand_xs)))
-            cand_ys = sorted(list(set(cand_ys)))
+                # Clean deterministic anchor generation from unbuffered part boundaries
+                cand_xs = [margin]
+                cand_ys = [margin]
+                for px, py, pw, ph in placed_bboxes:
+                    cand_xs.append(px + pw + kerf)
+                    cand_xs.append(px)
+                    cand_ys.append(py + ph + kerf)
+                    cand_ys.append(py)
+                cand_xs = sorted(list(set(cand_xs)))
+                cand_ys = sorted(list(set(cand_ys)))
 
-            for angle in [0.0, 90.0, 180.0, 270.0]:
-                prot = affinity.rotate(poly, angle, origin='center')
-                mnx, mny, mxx, mxy = prot.bounds
-                p_norm = affinity.translate(prot, -mnx, -mny)
-                pw, ph = mxx - mnx, mxy - mny
+                for angle in [0.0, 90.0, 180.0, 270.0]:
+                    prot = affinity.rotate(poly, angle, origin='center')
+                    mnx, mny, mxx, mxy = prot.bounds
+                    p_norm = affinity.translate(prot, -mnx, -mny)
+                    pw, ph = mxx - mnx, mxy - mny
 
-                for cy in cand_ys:
-                    if cy + ph > sheet_h - margin:
-                        continue
-                    for cx in cand_xs:
-                        if cx + pw > sheet_w - margin:
+                    for cy in cand_ys:
+                        if cy + ph > sheet_h - margin:
                             continue
-                        cand_p = affinity.translate(p_norm, cx, cy)
-                        cand_b = cand_p.buffer(kerf / 2.0)
-
-                        if tree is not None:
-                            overlaps = tree.query(cand_b, predicate='intersects')
-                            if len(overlaps) > 0:
+                        for cx in cand_xs:
+                            if cx + pw > sheet_w - margin:
                                 continue
+                            cand_p = affinity.translate(p_norm, cx, cy)
+                            cand_b = cand_p.buffer(kerf / 2.0)
 
-                        # Directional compaction cost: penalize expanding lateral width X
-                        cost = cand_b.bounds[2] * 10000.0 + cand_b.bounds[3]
-                        if cost < best_cost:
-                            best_cost = cost
-                            best_cand = (part_idx, angle, cx, cy, cand_p, cand_b)
+                            if tree is not None:
+                                hits = tree.query(cand_b)
+                                # 2D area overlap test: ignore 1D boundary touching
+                                if any(cand_b.intersection(placed_bufs[h]).area > 1.0 for h in hits):
+                                    continue
 
-            if best_cand:
-                p_idx, ang, cx, cy, cand_p, cand_b = best_cand
-                placed_instances.append(PlacedInstance(
-                    part_index=p_idx, angle=ang, x=cx, y=cy,
-                    polygon=cand_p, buffered_polygon=cand_b
-                ))
-                placed_bufs.append(cand_b)
+                            if cost_mode == 'horizontal':
+                                # Prioritize packing side-by-side along rows across sheet width
+                                cost = cand_b.bounds[3] * 10000.0 + cand_b.bounds[2]
+                            elif cost_mode == 'vertical':
+                                # Prioritize packing top-to-bottom along columns down sheet height
+                                cost = cand_b.bounds[2] * 10000.0 + cand_b.bounds[3]
+                            else:  # compact
+                                cost = cand_b.bounds[2] * cand_b.bounds[3] + (cand_b.bounds[2] + cand_b.bounds[3]) * 10.0
 
-        return placed_instances
+                            if cost < best_cost:
+                                best_cost = cost
+                                best_cand = (part_idx, angle, cx, cy, pw, ph, cand_p, cand_b)
+
+                if best_cand:
+                    p_idx, ang, cx, cy, pw, ph, cand_p, cand_b = best_cand
+                    placed_instances.append(PlacedInstance(
+                        part_index=p_idx, angle=ang, x=cx, y=cy,
+                        polygon=cand_p, buffered_polygon=cand_b
+                    ))
+                    placed_bufs.append(cand_b)
+                    placed_bboxes.append((cx, cy, pw, ph))
+                else:
+                    return None
+
+            return placed_instances
+
+        if strat == 'auto':
+            sol_h = solve_pass('horizontal')
+            sol_v = solve_pass('vertical')
+
+            def eval_solution(sol: Optional[List[PlacedInstance]], is_horizontal: bool):
+                if not sol:
+                    return -1.0, None, 0.0, (0.0, 0.0)
+                max_x = max(p.buffered_polygon.bounds[2] for p in sol) / scale
+                max_y = max(p.buffered_polygon.bounds[3] for p in sol) / scale
+                if is_horizontal:
+                    cut_y = min(self.sheet_h_mm - 50.0, max_y + 15.0)
+                    rem_w = self.sheet_w_mm
+                    rem_h = self.sheet_h_mm - cut_y
+                    rem_area = (rem_w * rem_h) / 1e6
+                    # Substantial bonus for preserving full sheet width (1220mm) in inventory
+                    score = rem_area * (1.30 if rem_h >= 300.0 else 1.05)
+                    return score, 'horizontal', cut_y, (rem_w, rem_h)
+                else:
+                    cut_x = min(self.sheet_w_mm - 50.0, max_x + 15.0)
+                    rem_w = self.sheet_w_mm - cut_x
+                    rem_h = self.sheet_h_mm - 2 * self.margin_mm
+                    rem_area = (rem_w * rem_h) / 1e6
+                    # Usability penalty for narrow, awkward offcut strips (< 600mm)
+                    score = rem_area * (1.0 if rem_w >= 600.0 else 0.70)
+                    return score, 'vertical', cut_x, (rem_w, rem_h)
+
+            score_h, axis_h, cut_h, dims_h = eval_solution(sol_h, True)
+            score_v, axis_v, cut_v, dims_v = eval_solution(sol_v, False)
+
+            if score_h >= score_v and sol_h is not None:
+                return sol_h, 'horizontal', cut_h, dims_h
+            elif sol_v is not None:
+                return sol_v, 'vertical', cut_v, dims_v
+            elif sol_h is not None:
+                return sol_h, 'horizontal', cut_h, dims_h
+            else:
+                sol_c = solve_pass('compact')
+                if sol_c:
+                    max_y = max(p.buffered_polygon.bounds[3] for p in sol_c) / scale
+                    cut_y = min(self.sheet_h_mm - 50.0, max_y + 15.0)
+                    return sol_c, 'horizontal', cut_y, (self.sheet_w_mm, self.sheet_h_mm - cut_y)
+                return None
+        elif strat == 'horizontal':
+            sol = solve_pass('horizontal')
+            if not sol:
+                return None
+            max_y = max(p.buffered_polygon.bounds[3] for p in sol) / scale
+            cut_y = min(self.sheet_h_mm - 50.0, max_y + 15.0)
+            return sol, 'horizontal', cut_y, (self.sheet_w_mm, self.sheet_h_mm - cut_y)
+        elif strat == 'vertical':
+            sol = solve_pass('vertical')
+            if not sol:
+                return None
+            max_x = max(p.buffered_polygon.bounds[2] for p in sol) / scale
+            cut_x = min(self.sheet_w_mm - 50.0, max_x + 15.0)
+            return sol, 'vertical', cut_x, (self.sheet_w_mm - cut_x, self.sheet_h_mm - 2 * self.margin_mm)
+        else:  # 'compact'
+            sol = solve_pass('compact')
+            if not sol:
+                return None
+            max_y = max(p.buffered_polygon.bounds[3] for p in sol) / scale
+            cut_y = min(self.sheet_h_mm - 50.0, max_y + 15.0)
+            return sol, 'horizontal', cut_y, (self.sheet_w_mm, self.sheet_h_mm - cut_y)
 
     def run_batch_order(
         self,
@@ -356,16 +449,39 @@ class MultiSheetBatchPlanner:
             total_rem_area = sum(it[2].outer_path.polygon.area for it in remaining_items)
 
             # If remaining items fit comfortably on a partial sheet, apply Directional Compaction
-            compact_placed = None
+            compact_res = None
             if total_rem_area < sheet_usable_area * 0.70:
-                compact_placed = self.pack_directional_compaction(remaining_items)
+                compact_res = self.pack_directional_compaction(remaining_items)
 
-            if compact_placed and len(compact_placed) == len(remaining_items):
-                sheet_placed = compact_placed
+            guillotine_cut_axis = None
+            guillotine_cut_x = None
+            guillotine_cut_y = None
+            remnant_w = None
+            remnant_h = None
+            remnant_m2 = None
+
+            if compact_res and len(compact_res[0]) == len(remaining_items):
+                sheet_placed, cut_axis, cut_val, rem_dims = compact_res
                 sheet_counts = {name: remaining_order[name] for name, _ in active_parts}
                 for name in list(remaining_order.keys()):
                     remaining_order[name] = 0
                 is_partial = True
+
+                if cut_axis == 'horizontal':
+                    guillotine_cut_axis = 'y'
+                    guillotine_cut_y = cut_val
+                else:
+                    guillotine_cut_axis = 'x'
+                    guillotine_cut_x = cut_val
+                remnant_w, remnant_h = rem_dims
+                remnant_m2 = (remnant_w * remnant_h) / 1e6
+
+                print(f"\n  >>> RATIONAL COMPACTION & REUSABLE REMNANT CUT LINE ({cut_axis.upper()}) <<<")
+                if cut_axis == 'horizontal':
+                    print(f"      Guillotine Shear Line : Y = {guillotine_cut_y:.1f} mm (horizontal pass across plate)")
+                else:
+                    print(f"      Guillotine Shear Line : X = {guillotine_cut_x:.1f} mm (vertical pass down plate)")
+                print(f"      Salvaged Virgin Plate : {remnant_w:.1f} x {remnant_h:.1f} mm ({remnant_m2:.3f} m² prime stock)")
             else:
                 engine = IndustrialNestingEngine(
                     sheet_w_mm=self.sheet_w_mm,
@@ -391,25 +507,33 @@ class MultiSheetBatchPlanner:
                 is_last_sheet = not any(v > 0 for v in remaining_order.values())
                 is_partial = is_last_sheet and (len(sheet_placed) < res.total_parts_count * 0.90)
 
-            # Calculate Guillotine Cut Line for partial sheet
-            guillotine_cut_x = None
-            remnant_w = None
-            remnant_h = None
-            remnant_m2 = None
+                # Calculate Guillotine Cut Line for partial sheet
+                if is_partial and sheet_placed:
+                    max_x_placed = max(p.buffered_polygon.bounds[2] for p in sheet_placed) / scale
+                    max_y_placed = max(p.buffered_polygon.bounds[3] for p in sheet_placed) / scale
+                    cut_y_cand = min(self.sheet_h_mm - 50.0, max_y_placed + 15.0)
+                    rem_h_area = self.sheet_w_mm * (self.sheet_h_mm - cut_y_cand) / 1e6
+                    cut_x_cand = min(self.sheet_w_mm - 50.0, max_x_placed + 15.0)
+                    rem_v_area = (self.sheet_w_mm - cut_x_cand) * (self.sheet_h_mm - 2 * self.margin_mm) / 1e6
 
-            if is_partial and sheet_placed:
-                # Find maximum X reached by placed parts (scaled to mm)
-                max_x_placed = max(p.buffered_polygon.bounds[2] for p in sheet_placed) / scale
-                # Safe guillotine trim line with 15mm clearance
-                guillotine_cut_x = min(self.sheet_w_mm - 50.0, max_x_placed + 15.0)
-                remnant_w = self.sheet_w_mm - guillotine_cut_x
-                remnant_h = self.sheet_h_mm - 2 * self.margin_mm
-                remnant_m2 = (remnant_w * remnant_h) / 1e6
-
-                print("\n  >>> DIRECTIONAL COMPACTION & REUSABLE REMNANT CUT LINE DETECTED <<<")
-                print(f"      Parts Compacted to  : X <= {max_x_placed:.1f} mm")
-                print(f"      Guillotine Cut Line : X = {guillotine_cut_x:.1f} mm (single straight pass)")
-                print(f"      Salvable Remnant    : {remnant_w:.1f} x {remnant_h:.1f} mm ({remnant_m2:.3f} m² prime stock)")
+                    if rem_h_area >= rem_v_area and (self.sheet_h_mm - cut_y_cand) >= 200.0:
+                        guillotine_cut_axis = 'y'
+                        guillotine_cut_y = cut_y_cand
+                        remnant_w = self.sheet_w_mm
+                        remnant_h = self.sheet_h_mm - cut_y_cand
+                        remnant_m2 = rem_h_area
+                        print(f"\n  >>> REUSABLE REMNANT CUT LINE (HORIZONTAL SHEAR) <<<")
+                        print(f"      Guillotine Cut Line : Y = {guillotine_cut_y:.1f} mm")
+                        print(f"      Salvaged Remnant    : {remnant_w:.1f} x {remnant_h:.1f} mm ({remnant_m2:.3f} m²)")
+                    else:
+                        guillotine_cut_axis = 'x'
+                        guillotine_cut_x = cut_x_cand
+                        remnant_w = self.sheet_w_mm - cut_x_cand
+                        remnant_h = self.sheet_h_mm - 2 * self.margin_mm
+                        remnant_m2 = rem_v_area
+                        print(f"\n  >>> REUSABLE REMNANT CUT LINE (VERTICAL SHEAR) <<<")
+                        print(f"      Guillotine Cut Line : X = {guillotine_cut_x:.1f} mm")
+                        print(f"      Salvaged Remnant    : {remnant_w:.1f} x {remnant_h:.1f} mm ({remnant_m2:.3f} m²)")
 
             # Generate Sheet Production SVG
             os.makedirs("output", exist_ok=True)
@@ -418,6 +542,7 @@ class MultiSheetBatchPlanner:
                 sheet_placed=sheet_placed,
                 named_parts=active_parts,
                 guillotine_cut_x=guillotine_cut_x,
+                guillotine_cut_y=guillotine_cut_y,
                 remnant_dims=(remnant_w, remnant_h) if remnant_w else None,
                 output_path=sheet_svg_path,
                 sheet_idx=sheet_no
@@ -439,7 +564,9 @@ class MultiSheetBatchPlanner:
                 utilization_pct=yield_pct,
                 scrap_pct=100.0 - yield_pct,
                 is_partial_sheet=is_partial,
+                guillotine_cut_axis=guillotine_cut_axis,
                 guillotine_cut_x_mm=guillotine_cut_x,
+                guillotine_cut_y_mm=guillotine_cut_y,
                 remnant_w_mm=remnant_w,
                 remnant_h_mm=remnant_h,
                 remnant_area_m2=remnant_m2,
@@ -465,8 +592,10 @@ class MultiSheetBatchPlanner:
             tag = " [PARTIAL - REMNANT PRESERVED]" if r.is_partial_sheet else " [FULL CAPACITY]"
             counts_str = ", ".join([f"{k}: {v}" for k, v in r.part_counts.items()])
             print(f"  Sheet #{r.sheet_index}{tag}: {r.total_parts} parts ({counts_str}) | Yield: {r.utilization_pct:.1f}%")
-            if r.guillotine_cut_x_mm:
-                print(f"      -> Guillotine Cut Line @ X = {r.guillotine_cut_x_mm:.1f} mm | Remnant: {r.remnant_w_mm:.1f}x{r.remnant_h_mm:.1f} mm ({r.remnant_area_m2:.3f} m²)")
+            if r.guillotine_cut_y_mm:
+                print(f"      -> Guillotine Cut Line @ Y = {r.guillotine_cut_y_mm:.1f} mm (Horizontal) | Remnant: {r.remnant_w_mm:.1f}x{r.remnant_h_mm:.1f} mm ({r.remnant_area_m2:.3f} m²)")
+            elif r.guillotine_cut_x_mm:
+                print(f"      -> Guillotine Cut Line @ X = {r.guillotine_cut_x_mm:.1f} mm (Vertical) | Remnant: {r.remnant_w_mm:.1f}x{r.remnant_h_mm:.1f} mm ({r.remnant_area_m2:.3f} m²)")
             print(f"      -> Output SVG: {r.output_svg_path}")
 
         print("-" * 80)
@@ -484,12 +613,13 @@ class MultiSheetBatchPlanner:
         self,
         sheet_placed: List[PlacedInstance],
         named_parts: List[Tuple[str, IsolatedObject]],
-        guillotine_cut_x: Optional[float],
-        remnant_dims: Optional[Tuple[float, float]],
-        output_path: str,
-        sheet_idx: int
+        guillotine_cut_x: Optional[float] = None,
+        guillotine_cut_y: Optional[float] = None,
+        remnant_dims: Optional[Tuple[float, float]] = None,
+        output_path: str = "output/sheet.svg",
+        sheet_idx: int = 1
     ):
-        """Generate SVG with highlighted guillotine shear line and remnant zone."""
+        """Generate SVG with highlighted guillotine shear line (horizontal or vertical) and remnant zone."""
         scale = 100.0
         sheet_w = self.sheet_w_mm * scale
         sheet_h = self.sheet_h_mm * scale
@@ -526,7 +656,20 @@ class MultiSheetBatchPlanner:
         ]
 
         # Draw Remnant Box & Guillotine Line if present
-        if guillotine_cut_x:
+        if guillotine_cut_y is not None and remnant_dims is not None:
+            cut_y = guillotine_cut_y * scale
+            rem_w_mm, rem_h_mm = remnant_dims
+            rem_w = rem_w_mm * scale
+            rem_h = rem_h_mm * scale
+            rem_x = margin
+            rem_y = cut_y
+
+            svg_lines.append('  <!-- REUSABLE REMNANT ZONE (HORIZONTAL SHEAR) -->')
+            svg_lines.append(f'  <rect class="remnant-fill" x="{rem_x:.1f}" y="{rem_y:.1f}" width="{sheet_w - 2*margin:.1f}" height="{rem_h:.1f}" />')
+            svg_lines.append(f'  <line class="guillotine-line" x1="0" y1="{cut_y:.1f}" x2="{sheet_w:.1f}" y2="{cut_y:.1f}" />')
+            svg_lines.append(f'  <text x="{sheet_w * 0.5:.1f}" y="{cut_y - 200:.1f}" text-anchor="middle" class="guillotine-label">✂ STRAIGHT GUILLOTINE SHEAR LINE (Y={guillotine_cut_y:.1f}mm)</text>')
+            svg_lines.append(f'  <text x="{sheet_w * 0.5:.1f}" y="{rem_y + rem_h/2.0:.1f}" text-anchor="middle" class="remnant-label">REUSABLE VIRGIN REMNANT ({rem_w_mm:.0f} x {rem_h_mm:.0f} mm)</text>')
+        elif guillotine_cut_x is not None and remnant_dims is not None:
             cut_x = guillotine_cut_x * scale
             rem_w_mm, rem_h_mm = remnant_dims
             rem_w = rem_w_mm * scale
@@ -534,7 +677,7 @@ class MultiSheetBatchPlanner:
             rem_x = cut_x
             rem_y = margin
 
-            svg_lines.append('  <!-- REUSABLE REMNANT ZONE -->')
+            svg_lines.append('  <!-- REUSABLE REMNANT ZONE (VERTICAL SHEAR) -->')
             svg_lines.append(f'  <rect class="remnant-fill" x="{rem_x:.1f}" y="{rem_y:.1f}" width="{rem_w:.1f}" height="{rem_h:.1f}" />')
             svg_lines.append(f'  <line class="guillotine-line" x1="{cut_x:.1f}" y1="0" x2="{cut_x:.1f}" y2="{sheet_h:.1f}" />')
             svg_lines.append(f'  <text x="{cut_x - 300:.1f}" y="{sheet_h * 0.45:.1f}" transform="rotate(-90 {cut_x - 300:.1f} {sheet_h * 0.45:.1f})" class="guillotine-label">✂ STRAIGHT GUILLOTINE SHEAR LINE (X={guillotine_cut_x:.1f}mm)</text>')

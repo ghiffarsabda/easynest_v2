@@ -126,10 +126,14 @@ def parse_sheet_metadata(svg_path: str) -> Dict[str, Any]:
     vb_match = re.search(r'viewBox="([^"]+)"', content)
     viewbox = vb_match.group(1) if vb_match else "0 0 122000 244000"
 
-    # Guillotine cut line detection
-    has_cut = ("guillotine-cut-line" in content or "STRAIGHT GUILLOTINE" in content)
+    # Guillotine cut line detection (horizontal or vertical)
+    has_cut = ("guillotine-line" in content or "guillotine-cut-line" in content or "STRAIGHT GUILLOTINE" in content)
     cut_x_match = re.search(r'X\s*=\s*([0-9.]+)\s*mm', content)
+    cut_y_match = re.search(r'Y\s*=\s*([0-9.]+)\s*mm', content)
     cut_x_mm = float(cut_x_match.group(1)) if (has_cut and cut_x_match) else None
+    cut_y_mm = float(cut_y_match.group(1)) if (has_cut and cut_y_match) else None
+    cut_axis = 'y' if cut_y_mm is not None else ('x' if cut_x_mm is not None else None)
+    cut_pos_mm = cut_y_mm if cut_axis == 'y' else cut_x_mm
 
     # Remnant detection
     remnant_match = re.search(r'REUSABLE VIRGIN REMNANT\s*\(([^\)]+)\)', content)
@@ -171,7 +175,10 @@ def parse_sheet_metadata(svg_path: str) -> Dict[str, Any]:
         "total_parts": len(parts),
         "part_counts": part_counts,
         "is_partial": is_partial,
+        "cut_axis": cut_axis,
+        "cut_pos_mm": cut_pos_mm,
         "cut_x_mm": cut_x_mm,
+        "cut_y_mm": cut_y_mm,
         "remnant_dims": remnant_dims,
         "viewbox": viewbox,
         "mtime": os.path.getmtime(svg_path)
@@ -224,7 +231,8 @@ def execute_production_batch(
     sheet_w_mm: float = 1220.0,
     sheet_h_mm: float = 2440.0,
     kerf_mm: float = 2.0,
-    margin_mm: float = 5.0
+    margin_mm: float = 5.0,
+    packing_strategy: str = "auto"
 ) -> Dict[str, Any]:
     """Executes MultiSheetBatchPlanner for a user-configured production batch."""
     from batch_nest import MultiSheetBatchPlanner
@@ -246,7 +254,8 @@ def execute_production_batch(
         sheet_w_mm=sheet_w_mm,
         sheet_h_mm=sheet_h_mm,
         kerf_mm=kerf_mm,
-        margin_mm=margin_mm
+        margin_mm=margin_mm,
+        packing_strategy=packing_strategy
     )
 
     t0 = time.time()
@@ -1059,6 +1068,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
           <label class="input-label" for="input-margin">Sheet Border Margin (mm)</label>
           <input id="input-margin" class="form-control" type="number" value="5.0" step="1.0" min="0.0" max="50.0" />
         </div>
+
+        <!-- Rational Compaction Strategy -->
+        <div class="input-group">
+          <label class="input-label" for="select-packing-strategy">Compaction Strategy</label>
+          <select id="select-packing-strategy" class="form-control">
+            <option value="auto" selected>Auto (Smart Operator — Best Remnant)</option>
+            <option value="horizontal">Horizontal Strip (Top Row across plate)</option>
+            <option value="vertical">Vertical Strip (Left Column down plate)</option>
+            <option value="compact">Compact Block (Corner Envelope)</option>
+          </select>
+        </div>
       </div>
     </div>
 
@@ -1327,6 +1347,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const sheetH = parseFloat(document.getElementById('input-sheet-h').value) || 2440.0;
       const kerf = parseFloat(document.getElementById('input-kerf').value) || 2.0;
       const margin = parseFloat(document.getElementById('input-margin').value) || 5.0;
+      const packingStrategy = document.getElementById('select-packing-strategy').value || 'auto';
 
       const overlay = document.getElementById('progress-overlay');
       overlay.style.display = 'flex';
@@ -1343,7 +1364,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
             sheet_w_mm: sheetW,
             sheet_h_mm: sheetH,
             kerf_mm: kerf,
-            margin_mm: margin
+            margin_mm: margin,
+            packing_strategy: packingStrategy
           })
         });
 
@@ -1430,12 +1452,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
       document.getElementById('stat-total-parts').textContent = `${sheet.total_parts} parts`;
 
       const remnantPill = document.getElementById('top-remnant-pill');
-      if (sheet.cut_x_mm && sheet.remnant_dims) {
+      const axis = sheet.cut_axis ? sheet.cut_axis.toUpperCase() : (sheet.cut_y_mm ? 'Y' : 'X');
+      const cutPos = sheet.cut_pos_mm || sheet.cut_y_mm || sheet.cut_x_mm;
+      if (cutPos && sheet.remnant_dims) {
         remnantPill.style.display = 'inline-flex';
-        remnantPill.innerHTML = `✂ Cut @ X = ${sheet.cut_x_mm.toFixed(1)} mm • Remnant: ${sheet.remnant_dims}`;
-      } else if (sheet.cut_x_mm) {
+        remnantPill.innerHTML = `✂ Shear Cut @ ${axis} = ${cutPos.toFixed(1)} mm • Remnant: ${sheet.remnant_dims}`;
+      } else if (cutPos) {
         remnantPill.style.display = 'inline-flex';
-        remnantPill.innerHTML = `✂ Cut @ X = ${sheet.cut_x_mm.toFixed(1)} mm`;
+        remnantPill.innerHTML = `✂ Shear Cut @ ${axis} = ${cutPos.toFixed(1)} mm`;
       } else {
         remnantPill.style.display = 'none';
       }
@@ -1648,6 +1672,7 @@ class VisualizerRequestHandler(SimpleHTTPRequestHandler):
                 sheet_h = float(data.get("sheet_h_mm", 2440.0))
                 kerf = float(data.get("kerf_mm", 2.0))
                 margin = float(data.get("margin_mm", 5.0))
+                packing_strategy = data.get("packing_strategy", "auto")
 
                 result = execute_production_batch(
                     batch_name=batch_name,
@@ -1655,7 +1680,8 @@ class VisualizerRequestHandler(SimpleHTTPRequestHandler):
                     sheet_w_mm=sheet_w,
                     sheet_h_mm=sheet_h,
                     kerf_mm=kerf,
-                    margin_mm=margin
+                    margin_mm=margin,
+                    packing_strategy=packing_strategy
                 )
 
                 self.send_response(200)
