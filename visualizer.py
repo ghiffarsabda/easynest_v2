@@ -1,17 +1,14 @@
 #!/usr/bin/env python3
 """
-EasyNest v2 - Industrial Batch Nesting Local Visualizer
-======================================================
-A lightweight, zero-dependency visualizer to inspect nesting outputs and batches.
-Runs locally using Python's standard library http.server.
+EasyNest v2 - Interactive Batch Production Studio & Visualizer
+=============================================================
+A lightweight, zero-dependency local web application to:
+1. Browse the CAD Product Catalogue (12 realistic motorcycle components).
+2. Configure custom production batches (custom quantities, sheet sizes, kerf, margin).
+3. Process the batch in real-time across multiple sequential sheets with directional compaction & guillotine shear cut lines.
+4. Interactively inspect and verify all sheets with 60fps GPU-accelerated pan & zoom.
 
-Features:
-- Responsive desktop & mobile UI (works directly from your phone/tablet/laptop)
-- Interactive vector SVG pan & zoom (scroll wheel, touch pinch, drag)
-- Instant part inspection: hover to view part name, ID, and position
-- Side-by-side / toggle view for Rendered PNG previews
-- Automatic detection of Reusable Remnants and Straight Guillotine Cut Lines
-- Live auto-refresh when new batch nests are generated
+Zero external dependencies. Runs locally on Python standard library http.server.
 """
 
 import os
@@ -19,14 +16,20 @@ import sys
 import glob
 import re
 import json
+import time
 import socket
 import socketserver
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 
 PORT = 8080
-OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+OUTPUT_DIR = os.path.join(BASE_DIR, "output")
+PARTS_DIR = os.path.join(BASE_DIR, "parts")
+
+# Cache for loaded CAD parts
+_CACHED_NAMED_PARTS = None
 
 
 def get_local_ip() -> str:
@@ -41,8 +44,70 @@ def get_local_ip() -> str:
         return "127.0.0.1"
 
 
+def get_named_parts():
+    """Loads and caches isolated CAD parts from parts/."""
+    global _CACHED_NAMED_PARTS
+    if _CACHED_NAMED_PARTS is not None:
+        return _CACHED_NAMED_PARTS
+
+    from cdr_enhancer import extract_paths_from_svg, build_isolated_objects
+    part_files = sorted([f for f in os.listdir(PARTS_DIR) if f.endswith(".svg")])
+    named_parts = []
+    for pf in part_files:
+        full_p = os.path.join(PARTS_DIR, pf)
+        pname = os.path.splitext(pf)[0]
+        paths = extract_paths_from_svg(full_p)
+        objs = build_isolated_objects(paths)
+        if objs:
+            named_parts.append((pname, objs[0]))
+    _CACHED_NAMED_PARTS = named_parts
+    return _CACHED_NAMED_PARTS
+
+
+def get_catalogue() -> List[Dict[str, Any]]:
+    """Builds the catalogue of available CAD parts with metadata."""
+    named_parts = get_named_parts()
+    catalogue = []
+
+    friendly_names = {
+        "p01_front_fairing": ("Front Fairing", "Tier A (Large Panels)", "Aerodynamic front cowl with M8 mounts & central headlight cutout"),
+        "p02_rear_tail_hugger": ("Rear Tail Hugger", "Tier A (Large Panels)", "Curved rear tire fender with massive concave tire arch void"),
+        "p03_radiator_shroud": ("Radiator Shroud", "Tier A (Large Panels)", "Angled airflow radiator duct with 3 cooling louvers"),
+        "p04_engine_skid_plate": ("Engine Skid Plate", "Tier A (Large Panels)", "Heavy-duty sump protection plate with drainage port & 8 cooling slots"),
+        "p05_tail_tidy_bracket": ("Tail Tidy Bracket", "Tier B (Medium Brackets)", "License plate & turn signal bracket with wiring pass-through"),
+        "p06_rearset_footpeg_hanger": ("Footpeg Hanger", "Tier B (Medium Brackets)", "CNC foot control hanger with pivot bore & 4-position adjustment"),
+        "p07_exhaust_heat_shield": ("Exhaust Heat Shield", "Tier B (Medium Brackets)", "Curved silencer heat guard with dual airflow baffle relief"),
+        "p08_triple_tree_fork_brace": ("Triple Tree Fork Brace", "Tier B (Medium Brackets)", "Front fork stabilizer brace with dual 50mm clamp bores & stem port"),
+        "p09_radiator_grill_bracket": ("Radiator Grill Bracket", "Tier C (Small Hardware)", "Slim mounting bracket with 6 slotted fastener holes"),
+        "p10_brake_caliper_bracket": ("Brake Caliper Bracket", "Tier C (Small Hardware)", "Radial brake caliper adapter plate with 4 heavy M10 mounting holes"),
+        "p11_handlebar_clamp": ("Handlebar Clamp", "Tier C (Small Hardware)", "Top handlebar riser clamp with 5 fastener bores"),
+        "p12_frame_gusset_tag": ("Frame Gusset Tag", "Tier C (Small Hardware)", "Triangular chassis reinforcement gusset with lightening aperture")
+    }
+
+    for name, obj in named_parts:
+        title, tier, desc = friendly_names.get(name, (name, "General Parts", ""))
+        w_mm = round(obj.width / 100.0, 1)
+        h_mm = round(obj.height / 100.0, 1)
+        area_cm2 = round(obj.outer_path.polygon.area / 10000.0 / 100.0, 1)
+        holes_count = len(obj.holes)
+
+        catalogue.append({
+            "id": name,
+            "title": title,
+            "tier": tier,
+            "description": desc,
+            "width_mm": w_mm,
+            "height_mm": h_mm,
+            "area_cm2": area_cm2,
+            "holes": holes_count,
+            "svg_url": f"/parts/{name}.svg"
+        })
+
+    return catalogue
+
+
 def parse_sheet_metadata(svg_path: str) -> Dict[str, Any]:
-    """Extracts nesting metrics, part counts, and remnant information from an SVG file."""
+    """Extracts nesting metrics, part counts, and remnant info from an SVG file."""
     filename = os.path.basename(svg_path)
     base_name = os.path.splitext(filename)[0]
     preview_png = f"{base_name}_preview.png"
@@ -70,41 +135,39 @@ def parse_sheet_metadata(svg_path: str) -> Dict[str, Any]:
     remnant_match = re.search(r'REUSABLE VIRGIN REMNANT\s*\(([^\)]+)\)', content)
     remnant_dims = remnant_match.group(1).strip() if remnant_match else None
 
-    # Condition / Batch category classification
-    condition_id = "other"
-    condition_title = "Other Outputs"
+    # Batch grouping logic
+    # Look for batch pattern: <batch_prefix>_sheet_<N>.svg OR condX_...
     sheet_num = 1
-
-    if "cond1" in filename:
-        condition_id = "cond1"
-        condition_title = "Condition 1: Single-Part Max Fit"
-    elif "cond2" in filename:
-        condition_id = "cond2"
-        condition_title = "Condition 2: Max Mixed Fit (Ideal Pair)"
-    elif "cond3" in filename:
-        condition_id = "cond3"
-        condition_title = "Condition 3: Custom Fixed Order (45 Fairings)"
-    elif "cond4" in filename:
-        condition_id = "cond4"
-        condition_title = "Condition 4: Mixed Custom Assembly BOM"
-    elif "cond5" in filename:
-        condition_id = "cond5"
-        condition_title = "Condition 5: Rush Kanban + Remnant Salvage"
-
-    sheet_match = re.search(r'sheet_(\d+)', filename)
+    sheet_match = re.search(r'_sheet_(\d+)', filename)
     if sheet_match:
         sheet_num = int(sheet_match.group(1))
+        batch_id = filename[:sheet_match.start()]
+    elif "cond1" in filename:
+        batch_id = "cond1_single_maxfit"
+    elif "cond2" in filename:
+        batch_id = "cond2_ideal_mixed_maxfit"
+    else:
+        batch_id = base_name
+
+    friendly_batch_titles = {
+        "cond1_single_maxfit": "Condition 1: Single-Part Max Fit (p01)",
+        "cond2_ideal_mixed_maxfit": "Condition 2: Max Mixed Fit (Ideal Pair p02+p08)",
+        "cond3_fixed_order": "Condition 3: Fixed Order (45 Fairings)",
+        "cond4_assembly_bom": "Condition 4: Mixed Assembly BOM (225 Parts)",
+        "cond5_rush_kanban": "Condition 5: Rush Kanban (35 Parts)"
+    }
+    batch_title = friendly_batch_titles.get(batch_id, batch_id.replace("_", " ").title())
 
     is_partial = (remnant_dims is not None) or ("PARTIAL" in content)
 
     return {
         "filename": filename,
+        "batch_id": batch_id,
+        "batch_title": batch_title,
+        "sheet_num": sheet_num,
         "svg_url": f"/output/{filename}",
         "png_url": f"/output/{preview_png}" if has_png else None,
         "has_png": has_png,
-        "condition_id": condition_id,
-        "condition_title": condition_title,
-        "sheet_num": sheet_num,
         "total_parts": len(parts),
         "part_counts": part_counts,
         "is_partial": is_partial,
@@ -115,31 +178,121 @@ def parse_sheet_metadata(svg_path: str) -> Dict[str, Any]:
     }
 
 
-def get_all_batches() -> List[Dict[str, Any]]:
-    """Gathers and groups all available output sheets."""
+def get_all_batches_grouped() -> List[Dict[str, Any]]:
+    """Gathers all output sheets and groups them into logical batches."""
     svg_files = glob.glob(os.path.join(OUTPUT_DIR, "*.svg"))
     sheets = [parse_sheet_metadata(p) for p in svg_files]
 
-    # Sort logically by condition and sheet number
-    def sort_key(s: Dict[str, Any]):
-        cond_order = {"cond1": 1, "cond2": 2, "cond3": 3, "cond4": 4, "cond5": 5, "other": 99}
-        return (cond_order.get(s["condition_id"], 99), s["sheet_num"], s["filename"])
+    # Group by batch_id
+    batch_dict: Dict[str, Dict[str, Any]] = {}
+    for s in sheets:
+        bid = s["batch_id"]
+        if bid not in batch_dict:
+            batch_dict[bid] = {
+                "batch_id": bid,
+                "batch_title": s["batch_title"],
+                "total_parts": 0,
+                "sheets": [],
+                "latest_mtime": s["mtime"]
+            }
+        batch_dict[bid]["sheets"].append(s)
+        batch_dict[bid]["total_parts"] += s["total_parts"]
+        batch_dict[bid]["latest_mtime"] = max(batch_dict[bid]["latest_mtime"], s["mtime"])
 
-    sheets.sort(key=sort_key)
-    return sheets
+    # Sort sheets within each batch by sheet_num
+    for bid, binfo in batch_dict.items():
+        binfo["sheets"].sort(key=lambda s: s["sheet_num"])
+        binfo["sheets_count"] = len(binfo["sheets"])
 
+    # Sort batches (newest custom batches first, standard test conditions at bottom or top)
+    sorted_batches = list(batch_dict.values())
+    cond_priority = {"cond1_single_maxfit": 1, "cond2_ideal_mixed_maxfit": 2, "cond3_fixed_order": 3, "cond4_assembly_bom": 4, "cond5_rush_kanban": 5}
+
+    def batch_sort_key(b):
+        bid = b["batch_id"]
+        if bid in cond_priority:
+            return (0, cond_priority[bid])
+        return (1, -b["latest_mtime"])
+
+    sorted_batches.sort(key=batch_sort_key)
+    return sorted_batches
+
+
+def execute_production_batch(
+    batch_name: str,
+    order: Dict[str, int],
+    sheet_w_mm: float = 1220.0,
+    sheet_h_mm: float = 2440.0,
+    kerf_mm: float = 2.0,
+    margin_mm: float = 5.0
+) -> Dict[str, Any]:
+    """Executes MultiSheetBatchPlanner for a user-configured production batch."""
+    from batch_nest import MultiSheetBatchPlanner
+    from cdr_enhancer import render_preview_png
+
+    named_parts = get_named_parts()
+    valid_part_names = {name for name, _ in named_parts}
+    # Filter order to only valid catalogue parts with qty > 0
+    clean_order = {k: int(v) for k, v in order.items() if k in valid_part_names and int(v) > 0}
+    if not clean_order:
+        raise ValueError(f"Order must contain at least one valid part with quantity > 0. Valid parts: {sorted(list(valid_part_names))}")
+
+    # Sanitize batch slug
+    safe_slug = re.sub(r'[^a-zA-Z0-9_-]', '_', batch_name.strip())
+    if not safe_slug:
+        safe_slug = f"batch_{int(time.time())}"
+
+    planner = MultiSheetBatchPlanner(
+        sheet_w_mm=sheet_w_mm,
+        sheet_h_mm=sheet_h_mm,
+        kerf_mm=kerf_mm,
+        margin_mm=margin_mm
+    )
+
+    t0 = time.time()
+    records = planner.run_batch_order(clean_order, named_parts, output_prefix=safe_slug)
+    runtime_s = round(time.time() - t0, 2)
+
+    # Generate preview PNG for partial sheet or first sheet if possible
+    if records and records[-1].output_svg_path and os.path.exists(records[-1].output_svg_path):
+        png_out = records[-1].output_svg_path.replace(".svg", "_preview.png")
+        try:
+            render_preview_png(records[-1].output_svg_path, png_out, dpi=90)
+        except Exception:
+            pass
+
+    # Build response summary
+    total_parts = sum(r.total_parts for r in records)
+    total_salvage_m2 = sum((r.remnant_area_m2 or 0.0) for r in records)
+
+    return {
+        "success": True,
+        "batch_id": safe_slug,
+        "batch_title": safe_slug.replace("_", " ").title(),
+        "total_parts_ordered": sum(clean_order.values()),
+        "total_parts_produced": total_parts,
+        "sheets_count": len(records),
+        "salvaged_remnant_m2": round(total_salvage_m2, 3),
+        "runtime_seconds": runtime_s
+    }
+
+
+# ==============================================================================
+# HTML, CSS & JAVASCRIPT FRONTEND APPLICATION
+# ==============================================================================
 
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>EasyNest v2 — Production Visualizer</title>
+  <title>EasyNest v2 — Production Batch Studio & Visualizer</title>
   <style>
     :root {
       --bg: #090d16;
       --card-bg: #111827;
       --card-border: #1f2937;
+      --card-hover: #1e293b;
       --text: #f3f4f6;
       --text-dim: #9ca3af;
       --accent: #38bdf8;
@@ -162,7 +315,7 @@ HTML_PAGE = """<!DOCTYPE html>
       flex-direction: column;
     }
 
-    /* --- TOP NAVBAR --- */
+    /* --- TOP HEADER --- */
     header {
       background: #0d1322;
       border-bottom: 1px solid var(--card-border);
@@ -171,7 +324,7 @@ HTML_PAGE = """<!DOCTYPE html>
       align-items: center;
       justify-content: space-between;
       gap: 1rem;
-      z-index: 20;
+      z-index: 30;
     }
     .brand {
       display: flex;
@@ -211,6 +364,36 @@ HTML_PAGE = """<!DOCTYPE html>
       box-shadow: 0 0 8px var(--emerald);
     }
 
+    /* Top Nav Tabs */
+    .tab-switcher {
+      display: flex;
+      background: #111827;
+      padding: 3px;
+      border-radius: 8px;
+      border: 1px solid var(--card-border);
+      gap: 4px;
+    }
+    .tab-btn {
+      background: transparent;
+      border: none;
+      color: var(--text-dim);
+      font-size: 0.85rem;
+      font-weight: 600;
+      padding: 0.45rem 1rem;
+      border-radius: 6px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 0.45rem;
+      transition: all 0.15s;
+    }
+    .tab-btn:hover { color: var(--text); }
+    .tab-btn.active {
+      background: #0284c7;
+      color: white;
+      box-shadow: 0 2px 8px rgba(2, 132, 199, 0.35);
+    }
+
     .top-actions {
       display: flex;
       align-items: center;
@@ -237,38 +420,315 @@ HTML_PAGE = """<!DOCTYPE html>
       background: #0284c7;
       border-color: #0369a1;
       color: white;
+      font-weight: 600;
     }
     .btn-accent:hover { background: #0369a1; }
-    .btn-group {
-      display: flex;
-      background: #1e293b;
-      border-radius: 6px;
-      padding: 2px;
-      border: 1px solid #334155;
-    }
-    .btn-group .btn {
-      border: none;
-      background: transparent;
-      padding: 0.35rem 0.75rem;
-      border-radius: 4px;
-    }
-    .btn-group .btn.active {
-      background: #0284c7;
+    .btn-emerald {
+      background: #059669;
+      border-color: #047857;
       color: white;
-      box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+      font-weight: 700;
+      box-shadow: 0 2px 10px rgba(5, 150, 105, 0.3);
+    }
+    .btn-emerald:hover { background: #047857; }
+    .btn-emerald:disabled {
+      background: #1e293b;
+      border-color: #334155;
+      color: #64748b;
+      cursor: not-allowed;
+      box-shadow: none;
     }
 
-    /* --- APP LAYOUT --- */
-    .app-container {
-      display: flex;
+    /* --- VIEW CONTAINERS --- */
+    .view-container {
+      display: none;
       flex: 1;
       height: calc(100dvh - 54px);
       overflow: hidden;
     }
+    .view-container.active {
+      display: flex;
+    }
 
-    /* --- SIDEBAR --- */
+    /* ==========================================================================
+       TAB 1: BATCH STUDIO (CATALOGUE & CONFIG)
+       ========================================================================== */
+    .studio-layout {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      overflow-y: auto;
+      padding: 1.25rem 2rem;
+      gap: 1.25rem;
+      background: #070a12;
+    }
+
+    /* Config Bar */
+    .config-card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 10px;
+      padding: 1.2rem 1.5rem;
+      display: flex;
+      flex-direction: column;
+      gap: 1rem;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+    }
+    .config-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid #1f2937;
+      padding-bottom: 0.75rem;
+    }
+    .config-title {
+      font-size: 1rem;
+      font-weight: 700;
+      color: #f3f4f6;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+    .config-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 1.25rem;
+    }
+    .input-group {
+      display: flex;
+      flex-direction: column;
+      gap: 0.35rem;
+    }
+    .input-label {
+      font-size: 0.75rem;
+      font-weight: 600;
+      color: var(--text-dim);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .form-control {
+      background: #090d16;
+      border: 1px solid #374151;
+      color: #f3f4f6;
+      padding: 0.6rem 0.8rem;
+      border-radius: 6px;
+      font-size: 0.9rem;
+      font-family: inherit;
+      outline: none;
+      transition: border-color 0.15s;
+    }
+    .form-control:focus {
+      border-color: #38bdf8;
+      box-shadow: 0 0 0 1px #38bdf8;
+    }
+    .custom-sheet-row {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    /* Batch Action Banner */
+    .action-banner {
+      background: linear-gradient(90deg, #111e38, #0f2744);
+      border: 1px solid #0284c7;
+      border-radius: 10px;
+      padding: 1rem 1.5rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+      flex-wrap: wrap;
+    }
+    .banner-stats {
+      display: flex;
+      align-items: center;
+      gap: 1.5rem;
+      flex-wrap: wrap;
+    }
+    .banner-stat-item {
+      display: flex;
+      flex-direction: column;
+    }
+    .banner-stat-num {
+      font-size: 1.3rem;
+      font-weight: 800;
+      font-family: var(--font-mono);
+      color: #38bdf8;
+    }
+    .banner-stat-label {
+      font-size: 0.7rem;
+      text-transform: uppercase;
+      color: var(--text-dim);
+      letter-spacing: 0.05em;
+    }
+
+    .preset-pills {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      flex-wrap: wrap;
+    }
+    .preset-btn {
+      background: #1e293b;
+      border: 1px solid #334155;
+      color: #cbd5e1;
+      padding: 0.35rem 0.7rem;
+      border-radius: 6px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .preset-btn:hover { background: #334155; color: white; border-color: #475569; }
+
+    /* Catalogue Grid */
+    .catalogue-section {
+      display: flex;
+      flex-direction: column;
+      gap: 0.9rem;
+    }
+    .section-title {
+      font-size: 1.1rem;
+      font-weight: 700;
+      color: #f3f4f6;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .catalogue-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+      gap: 1rem;
+    }
+    .catalogue-card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 10px;
+      padding: 1rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+      transition: all 0.15s ease;
+      position: relative;
+    }
+    .catalogue-card:hover {
+      border-color: #38bdf8;
+      transform: translateY(-2px);
+      box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+    }
+    .catalogue-card.has-qty {
+      border-color: #0284c7;
+      background: #0f1c33;
+      box-shadow: 0 0 0 1px #0284c7;
+    }
+    .card-preview-box {
+      height: 140px;
+      background: #ffffff;
+      border-radius: 6px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0.5rem;
+      overflow: hidden;
+    }
+    .card-preview-box img {
+      max-width: 100%;
+      max-height: 100%;
+      object-fit: contain;
+    }
+    .card-meta-title {
+      font-size: 0.95rem;
+      font-weight: 700;
+      color: #f9fafb;
+    }
+    .card-meta-tier {
+      font-size: 0.7rem;
+      color: #38bdf8;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .card-dims {
+      font-size: 0.78rem;
+      color: var(--text-dim);
+      font-family: var(--font-mono);
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+    .card-desc {
+      font-size: 0.75rem;
+      color: #94a3b8;
+      line-height: 1.3;
+      min-height: 32px;
+    }
+
+    /* Stepper */
+    .stepper-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.5rem;
+      margin-top: auto;
+      padding-top: 0.5rem;
+      border-top: 1px solid #1f2937;
+    }
+    .stepper-controls {
+      display: flex;
+      align-items: center;
+      background: #090d16;
+      border: 1px solid #374151;
+      border-radius: 6px;
+      overflow: hidden;
+    }
+    .step-btn {
+      background: transparent;
+      border: none;
+      color: #f3f4f6;
+      width: 32px;
+      height: 32px;
+      font-size: 1.1rem;
+      font-weight: bold;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: background 0.1s;
+    }
+    .step-btn:hover { background: #374151; }
+    .step-input {
+      width: 48px;
+      height: 32px;
+      background: transparent;
+      border: none;
+      color: #38bdf8;
+      font-family: var(--font-mono);
+      font-size: 0.95rem;
+      font-weight: 700;
+      text-align: center;
+      outline: none;
+    }
+    .quick-adds {
+      display: flex;
+      gap: 0.3rem;
+    }
+    .quick-btn {
+      background: #1e293b;
+      border: 1px solid #334155;
+      color: #cbd5e1;
+      font-size: 0.7rem;
+      font-weight: 600;
+      padding: 0.25rem 0.45rem;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    .quick-btn:hover { background: #334155; color: white; }
+
+    /* ==========================================================================
+       TAB 2: SHEET VISUALIZER (INSPECTOR)
+       ========================================================================== */
     aside {
-      width: 320px;
+      width: 330px;
       min-width: 280px;
       background: #0c111e;
       border-right: 1px solid var(--card-border);
@@ -277,18 +737,18 @@ HTML_PAGE = """<!DOCTYPE html>
       overflow: hidden;
     }
     .sidebar-header {
-      padding: 0.9rem 1rem;
+      padding: 0.75rem 1rem;
       border-bottom: 1px solid var(--card-border);
       display: flex;
-      align-items: center;
-      justify-content: space-between;
+      flex-direction: column;
+      gap: 0.5rem;
     }
-    .sidebar-title {
-      font-size: 0.8rem;
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
+    .batch-select-label {
+      font-size: 0.7rem;
       color: var(--text-dim);
+      text-transform: uppercase;
       font-weight: 700;
+      letter-spacing: 0.05em;
     }
     .sheet-list {
       flex: 1;
@@ -296,17 +756,7 @@ HTML_PAGE = """<!DOCTYPE html>
       padding: 0.75rem;
       display: flex;
       flex-direction: column;
-      gap: 0.75rem;
-    }
-    .condition-group-title {
-      font-size: 0.75rem;
-      font-weight: 700;
-      color: #38bdf8;
-      padding: 0.4rem 0.5rem;
-      letter-spacing: 0.04em;
-      display: flex;
-      align-items: center;
-      gap: 0.4rem;
+      gap: 0.6rem;
     }
     .sheet-card {
       background: var(--card-bg);
@@ -317,12 +767,11 @@ HTML_PAGE = """<!DOCTYPE html>
       transition: all 0.15s ease;
       display: flex;
       flex-direction: column;
-      gap: 0.5rem;
+      gap: 0.4rem;
     }
     .sheet-card:hover {
       border-color: #38bdf8;
       transform: translateY(-1px);
-      box-shadow: 0 4px 12px rgba(0,0,0,0.3);
     }
     .sheet-card.active {
       border-color: #38bdf8;
@@ -344,7 +793,6 @@ HTML_PAGE = """<!DOCTYPE html>
       padding: 0.15rem 0.45rem;
       border-radius: 4px;
       font-weight: 600;
-      letter-spacing: 0.02em;
     }
     .badge-full {
       background: rgba(16, 185, 129, 0.15);
@@ -359,17 +807,12 @@ HTML_PAGE = """<!DOCTYPE html>
     .card-metrics {
       display: flex;
       align-items: center;
-      gap: 0.75rem;
-      font-size: 0.78rem;
+      gap: 0.6rem;
+      font-size: 0.75rem;
       color: var(--text-dim);
     }
-    .metric-item {
-      display: flex;
-      align-items: center;
-      gap: 0.3rem;
-    }
 
-    /* --- MAIN VIEWPORT --- */
+    /* Main Viewport */
     main {
       flex: 1;
       display: flex;
@@ -435,9 +878,7 @@ HTML_PAGE = """<!DOCTYPE html>
       will-change: transform;
       box-shadow: 0 20px 50px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(255, 255, 255, 0.1);
       background: #ffffff;
-      transition: box-shadow 0.2s ease;
     }
-
     #svg-host, #img-host {
       width: 100%;
       height: 100%;
@@ -449,7 +890,7 @@ HTML_PAGE = """<!DOCTYPE html>
       display: block;
     }
 
-    /* Part hover highlight */
+    /* Nested part interactive highlight */
     .nested-part {
       transition: opacity 0.15s, stroke-width 0.15s;
       cursor: pointer;
@@ -459,8 +900,14 @@ HTML_PAGE = """<!DOCTYPE html>
       stroke-width: 80 !important;
       fill-opacity: 0.75 !important;
     }
+    .nested-part.highlighted path {
+      stroke: #f59e0b !important;
+      stroke-width: 90 !important;
+      fill: #f59e0b !important;
+      fill-opacity: 0.8 !important;
+    }
 
-    /* --- BOTTOM INSPECTION DRAWER --- */
+    /* Inspector Drawer */
     .inspector-drawer {
       background: #0d1322;
       border-top: 1px solid var(--card-border);
@@ -516,13 +963,46 @@ HTML_PAGE = """<!DOCTYPE html>
       display: flex;
       align-items: center;
       gap: 0.4rem;
+      cursor: pointer;
+      user-select: none;
+      transition: all 0.15s;
     }
-    .part-tag span {
-      color: #38bdf8;
+    .part-tag:hover { background: #334155; border-color: #38bdf8; }
+    .part-tag span { color: #38bdf8; font-weight: 700; }
+
+    /* Modal / Progress Overlay */
+    #progress-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(9, 13, 22, 0.85);
+      backdrop-filter: blur(12px);
+      z-index: 999;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      flex-direction: column;
+      gap: 1rem;
+    }
+    .spinner {
+      width: 48px;
+      height: 48px;
+      border: 4px solid #1e293b;
+      border-top-color: #38bdf8;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .progress-text {
+      font-size: 1.1rem;
       font-weight: 700;
+      color: #f3f4f6;
+    }
+    .progress-subtext {
+      font-size: 0.85rem;
+      color: var(--text-dim);
+      font-family: var(--font-mono);
     }
 
-    /* Tooltip */
     #hover-tooltip {
       position: fixed;
       pointer-events: none;
@@ -537,56 +1017,158 @@ HTML_PAGE = """<!DOCTYPE html>
       z-index: 1000;
       display: none;
     }
-
-    /* Mobile responsive */
-    @media (max-width: 800px) {
-      aside { width: 100%; height: 200px; }
-      .app-container { flex-direction: column; }
-      .inspector-drawer { flex-direction: column; align-items: flex-start; }
-    }
   </style>
 </head>
 <body>
 
-  <!-- Top Bar -->
+  <!-- Top App Bar -->
   <header>
     <div class="brand">
       <span class="brand-badge">EASYNEST v2</span>
-      <span class="brand-title">Production Batch Visualizer</span>
+      <span class="brand-title">Production Studio & Visualizer</span>
       <div class="status-pill">
         <span class="status-dot"></span>
         <span id="host-label">Local Host</span>
       </div>
     </div>
 
-    <div class="top-actions">
-      <!-- Vector vs PNG Preview Toggle -->
-      <div class="btn-group">
-        <button id="view-mode-svg" class="btn active" onclick="setViewMode('svg')">Vector SVG</button>
-        <button id="view-mode-png" class="btn" onclick="setViewMode('png')">Rendered PNG</button>
-      </div>
+    <!-- Main View Switcher -->
+    <div class="tab-switcher">
+      <button id="tab-btn-studio" class="tab-btn active" onclick="switchView('studio')">
+        <span>📑</span> Batch Studio
+      </button>
+      <button id="tab-btn-viewer" class="tab-btn" onclick="switchView('viewer')">
+        <span>👁️</span> Sheet Inspector
+      </button>
+    </div>
 
+    <div class="top-actions">
       <button class="btn" onclick="prevSheet()" title="Previous Sheet (←)">◀ Prev</button>
       <button class="btn" onclick="nextSheet()" title="Next Sheet (→)">Next ▶</button>
-      <button class="btn btn-accent" onclick="loadBatches()" title="Rescan Output Folder">↻ Refresh</button>
+      <button class="btn btn-accent" onclick="refreshAll()" title="Refresh All Data">↻ Refresh</button>
     </div>
   </header>
 
-  <!-- Main App Layout -->
-  <div class="app-container">
+  <!-- =======================================================================
+       TAB 1: BATCH PRODUCTION STUDIO
+       ======================================================================= -->
+  <div id="view-studio" class="view-container studio-layout active">
 
-    <!-- Sidebar: Batch & Sheet Selector -->
+    <!-- Batch Configuration Form -->
+    <div class="config-card">
+      <div class="config-header">
+        <div class="config-title">
+          <span>⚙️</span> Batch Production Parameters
+        </div>
+        <div class="preset-pills">
+          <span style="font-size: 0.75rem; color: var(--text-dim); margin-right: 4px;">Quick Kits:</span>
+          <button class="preset-btn" onclick="applyPreset('bom')">🏍️ Complete 25-Bike BOM</button>
+          <button class="preset-btn" onclick="applyPreset('armor')">🛡️ Fairing & Skid Kit</button>
+          <button class="preset-btn" onclick="applyPreset('ideal')">⚡ Ideal Pair (p02 + p08)</button>
+          <button class="preset-btn" onclick="applyPreset('clear')">✕ Clear All (0)</button>
+        </div>
+      </div>
+
+      <div class="config-grid">
+        <!-- Batch Name -->
+        <div class="input-group">
+          <label class="input-label" for="input-batch-name">Batch Name / Identifier</label>
+          <input id="input-batch-name" class="form-control" type="text" placeholder="e.g. rush_motorcycle_run_01" />
+        </div>
+
+        <!-- Sheet Size Preset -->
+        <div class="input-group">
+          <label class="input-label" for="select-sheet-size">Sheet Size Preset</label>
+          <select id="select-sheet-size" class="form-control" onchange="onSheetSizeChange()">
+            <option value="1220x2440" selected>Standard Industrial: 1220 × 2440 mm (4×8 ft)</option>
+            <option value="1000x2000">Standard Metric: 1000 × 2000 mm (1×2 m)</option>
+            <option value="1220x1220">Square Half-Sheet: 1220 × 1220 mm (4×4 ft)</option>
+            <option value="600x1200">Compact Router Bed: 600 × 1200 mm</option>
+            <option value="custom">Custom Size (W × H mm)...</option>
+          </select>
+        </div>
+
+        <!-- Custom Dimensions (if selected) -->
+        <div id="custom-sheet-box" class="input-group" style="display: none;">
+          <label class="input-label">Custom Sheet (W × H mm)</label>
+          <div class="custom-sheet-row">
+            <input id="input-sheet-w" class="form-control" type="number" value="1220" min="200" max="10000" style="width: 100px;" />
+            <span>×</span>
+            <input id="input-sheet-h" class="form-control" type="number" value="2440" min="200" max="10000" style="width: 100px;" />
+            <span style="font-size: 0.8rem; color: var(--text-dim);">mm</span>
+          </div>
+        </div>
+
+        <!-- Tool Kerf Spacing -->
+        <div class="input-group">
+          <label class="input-label" for="input-kerf">Tool Cutting Kerf (mm)</label>
+          <input id="input-kerf" class="form-control" type="number" value="2.0" step="0.5" min="0.5" max="20.0" />
+        </div>
+
+        <!-- Margin Spacing -->
+        <div class="input-group">
+          <label class="input-label" for="input-margin">Sheet Border Margin (mm)</label>
+          <input id="input-margin" class="form-control" type="number" value="5.0" step="1.0" min="0.0" max="50.0" />
+        </div>
+      </div>
+    </div>
+
+    <!-- Live Order Action Banner -->
+    <div class="action-banner">
+      <div class="banner-stats">
+        <div class="banner-stat-item">
+          <span id="banner-parts-count" class="banner-stat-num">0</span>
+          <span class="banner-stat-label">Total Parts in Batch</span>
+        </div>
+        <div class="banner-stat-item">
+          <span id="banner-unique-parts" class="banner-stat-num">0</span>
+          <span class="banner-stat-label">Unique Part SKUs</span>
+        </div>
+        <div class="banner-stat-item">
+          <span id="banner-est-area" class="banner-stat-num">0.0 m²</span>
+          <span class="banner-stat-label">Est. Part Net Area</span>
+        </div>
+      </div>
+
+      <!-- Action Button -->
+      <button id="btn-process-batch" class="btn btn-emerald" style="padding: 0.75rem 1.75rem; font-size: 1rem;" onclick="processBatch()" disabled>
+        <span>🚀</span> PROCESS BATCH
+      </button>
+    </div>
+
+    <!-- Product Catalogue Section -->
+    <div class="catalogue-section">
+      <div class="section-title">
+        <span>🏍️ CAD Product Catalogue (Set Quantities)</span>
+      </div>
+
+      <div id="catalogue-grid" class="catalogue-grid">
+        <!-- Rendered dynamically -->
+      </div>
+    </div>
+
+  </div>
+
+  <!-- =======================================================================
+       TAB 2: SHEET INSPECTOR (INTERACTIVE CANVAS)
+       ======================================================================= -->
+  <div id="view-viewer" class="view-container">
+
+    <!-- Left Sidebar: Batch and Sheet Explorer -->
     <aside>
       <div class="sidebar-header">
-        <span class="sidebar-title">Production Sheets</span>
-        <span id="sheet-count-badge" class="badge badge-full">0 Sheets</span>
+        <label class="batch-select-label" for="select-batch">Select Production Batch</label>
+        <select id="select-batch" class="form-control" onchange="onBatchSelectChange()">
+          <!-- Populated dynamically -->
+        </select>
       </div>
+
       <div id="sheet-list" class="sheet-list">
         <!-- Rendered dynamically -->
       </div>
     </aside>
 
-    <!-- Main Canvas Viewport -->
+    <!-- Main Viewport -->
     <main>
       <!-- Floating Viewport Controls -->
       <div class="viewport-toolbar">
@@ -597,7 +1179,7 @@ HTML_PAGE = """<!DOCTYPE html>
         <button class="toolbar-btn" onclick="resetZoom()" title="1:1 Pixel Scale (1)">1:1</button>
       </div>
 
-      <!-- Canvas Pan / Zoom Area -->
+      <!-- Pan & Zoom Canvas -->
       <div id="canvas-container" class="canvas-container">
         <div id="sheet-wrapper" class="sheet-wrapper">
           <div id="svg-host"></div>
@@ -610,25 +1192,24 @@ HTML_PAGE = """<!DOCTYPE html>
         <div class="stat-pill-group">
           <div class="stat-pill">
             <span class="stat-label">Sheet Dimensions</span>
-            <span class="stat-val">1220 × 2440 mm</span>
+            <span id="stat-sheet-dims" class="stat-val">1220 × 2440 mm</span>
           </div>
           <div class="stat-pill">
-            <span class="stat-label">Total Parts Nested</span>
+            <span class="stat-label">Parts Placed</span>
             <span id="stat-total-parts" class="stat-val emerald">-</span>
           </div>
           <div class="stat-pill" id="stat-cut-box" style="display: none;">
-            <span class="stat-label">✂ Guillotine Cut</span>
+            <span class="stat-label">✂ Guillotine Cut Line</span>
             <span id="stat-cut-x" class="stat-val amber">-</span>
           </div>
           <div class="stat-pill" id="stat-remnant-box" style="display: none;">
-            <span class="stat-label">📦 Virgin Remnant</span>
+            <span class="stat-label">📦 Salvaged Remnant</span>
             <span id="stat-remnant" class="stat-val emerald">-</span>
           </div>
         </div>
 
-        <!-- Part counts tags -->
         <div class="stat-pill">
-          <span class="stat-label">Part Manifest</span>
+          <span class="stat-label">Sheet Part Breakdown</span>
           <div id="part-pills" class="part-pills">
             <!-- Rendered dynamically -->
           </div>
@@ -639,12 +1220,22 @@ HTML_PAGE = """<!DOCTYPE html>
 
   </div>
 
+  <!-- Fullscreen Loading Overlay -->
+  <div id="progress-overlay">
+    <div class="spinner"></div>
+    <div id="progress-text" class="progress-text">Processing Batch Nesting...</div>
+    <div id="progress-subtext" class="progress-subtext">Compacting layout across multiple sheets...</div>
+  </div>
+
   <div id="hover-tooltip"></div>
 
   <script>
-    let allSheets = [];
-    let currentSheetIndex = 0;
-    let viewMode = 'svg'; // 'svg' or 'png'
+    // Global State
+    let catalogueData = [];
+    let orderQuantities = {};
+    let allBatches = [];
+    let activeBatchId = null;
+    let activeSheetIndex = 0;
 
     // Pan & Zoom State
     let scale = 1.0;
@@ -661,6 +1252,363 @@ HTML_PAGE = """<!DOCTYPE html>
     const zoomText = document.getElementById('zoom-text');
     const tooltip = document.getElementById('hover-tooltip');
 
+    // Tab Switching
+    function switchView(viewName) {
+      document.getElementById('view-studio').classList.toggle('active', viewName === 'studio');
+      document.getElementById('view-viewer').classList.toggle('active', viewName === 'viewer');
+      document.getElementById('tab-btn-studio').classList.toggle('active', viewName === 'studio');
+      document.getElementById('tab-btn-viewer').classList.toggle('active', viewName === 'viewer');
+
+      if (viewName === 'viewer') {
+        setTimeout(fitToScreen, 50);
+      }
+    }
+
+    // Default Batch Name Generator
+    function generateDefaultBatchName() {
+      const now = new Date();
+      const pad = (n) => String(n).padStart(2, '0');
+      const stamp = `${now.getFullYear()}${pad(now.getMonth()+1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}`;
+      return `batch_${stamp}`;
+    }
+
+    // Sheet Size Preset Toggle
+    function onSheetSizeChange() {
+      const val = document.getElementById('select-sheet-size').value;
+      const customBox = document.getElementById('custom-sheet-box');
+      if (val === 'custom') {
+        customBox.style.display = 'flex';
+      } else {
+        customBox.style.display = 'none';
+        const parts = val.split('x');
+        document.getElementById('input-sheet-w').value = parts[0];
+        document.getElementById('input-sheet-h').value = parts[1];
+      }
+    }
+
+    // Load Catalogue from Server
+    async function loadCatalogue() {
+      try {
+        const res = await fetch('/api/catalogue');
+        catalogueData = await res.json();
+        renderCatalogue();
+      } catch (err) {
+        console.error('Failed to load catalogue:', err);
+      }
+    }
+
+    function renderCatalogue() {
+      const grid = document.getElementById('catalogue-grid');
+      grid.innerHTML = '';
+
+      catalogueData.forEach(item => {
+        const qty = orderQuantities[item.id] || 0;
+        const card = document.createElement('div');
+        card.className = `catalogue-card ${qty > 0 ? 'has-qty' : ''}`;
+        card.id = `card-${item.id}`;
+
+        card.innerHTML = `
+          <div class="card-preview-box">
+            <img src="${item.svg_url}" alt="${item.title}" loading="lazy" />
+          </div>
+          <div>
+            <div class="card-meta-tier">${item.tier}</div>
+            <div class="card-meta-title">${item.title}</div>
+            <div class="card-dims">${item.width_mm} × ${item.height_mm} mm • ${item.holes} holes</div>
+          </div>
+          <div class="card-desc">${item.description}</div>
+          <div class="stepper-row">
+            <div class="stepper-controls">
+              <button class="step-btn" onclick="modifyQty('${item.id}', -1)">−</button>
+              <input id="input-qty-${item.id}" class="step-input" type="number" min="0" max="1000" value="${qty}" onchange="setQty('${item.id}', this.value)" />
+              <button class="step-btn" onclick="modifyQty('${item.id}', 1)">＋</button>
+            </div>
+            <div class="quick-adds">
+              <button class="quick-btn" onclick="modifyQty('${item.id}', 5)">+5</button>
+              <button class="quick-btn" onclick="modifyQty('${item.id}', 10)">+10</button>
+            </div>
+          </div>
+        `;
+        grid.appendChild(card);
+      });
+
+      updateOrderSummary();
+    }
+
+    function modifyQty(partId, delta) {
+      const cur = orderQuantities[partId] || 0;
+      const next = Math.max(0, cur + delta);
+      setQty(partId, next);
+    }
+
+    function setQty(partId, val) {
+      const num = Math.max(0, parseInt(val) || 0);
+      orderQuantities[partId] = num;
+      const inp = document.getElementById(`input-qty-${partId}`);
+      if (inp) inp.value = num;
+
+      const card = document.getElementById(`card-${partId}`);
+      if (card) card.classList.toggle('has-qty', num > 0);
+
+      updateOrderSummary();
+    }
+
+    function updateOrderSummary() {
+      let totalParts = 0;
+      let uniqueCount = 0;
+      let totalAreaCm2 = 0;
+
+      for (const [id, qty] of Object.entries(orderQuantities)) {
+        if (qty > 0) {
+          totalParts += qty;
+          uniqueCount += 1;
+          const item = catalogueData.find(c => c.id === id);
+          if (item) totalAreaCm2 += item.area_cm2 * qty;
+        }
+      }
+
+      document.getElementById('banner-parts-count').textContent = totalParts;
+      document.getElementById('banner-unique-parts').textContent = uniqueCount;
+      document.getElementById('banner-est-area').textContent = `${(totalAreaCm2 / 10000).toFixed(2)} m²`;
+
+      const btn = document.getElementById('btn-process-batch');
+      btn.disabled = (totalParts === 0);
+      btn.innerHTML = `<span>🚀</span> PROCESS BATCH (${totalParts} Parts)`;
+    }
+
+    function applyPreset(type) {
+      orderQuantities = {};
+      if (type === 'bom') {
+        // Complete 25 motorcycle BOM
+        orderQuantities['p01_front_fairing'] = 25;
+        orderQuantities['p04_engine_skid_plate'] = 25;
+        orderQuantities['p05_tail_tidy_bracket'] = 25;
+        orderQuantities['p09_radiator_grill_bracket'] = 50;
+        orderQuantities['p12_frame_gusset_tag'] = 100;
+      } else if (type === 'armor') {
+        orderQuantities['p01_front_fairing'] = 12;
+        orderQuantities['p02_rear_tail_hugger'] = 12;
+        orderQuantities['p04_engine_skid_plate'] = 12;
+      } else if (type === 'ideal') {
+        orderQuantities['p02_rear_tail_hugger'] = 25;
+        orderQuantities['p08_triple_tree_fork_brace'] = 26;
+      }
+      renderCatalogue();
+    }
+
+    // Process Batch Run (POST /api/run_batch)
+    async function processBatch() {
+      const batchName = document.getElementById('input-batch-name').value.trim() || generateDefaultBatchName();
+      const sheetW = parseFloat(document.getElementById('input-sheet-w').value) || 1220.0;
+      const sheetH = parseFloat(document.getElementById('input-sheet-h').value) || 2440.0;
+      const kerf = parseFloat(document.getElementById('input-kerf').value) || 2.0;
+      const margin = parseFloat(document.getElementById('input-margin').value) || 5.0;
+
+      const overlay = document.getElementById('progress-overlay');
+      overlay.style.display = 'flex';
+      document.getElementById('progress-text').textContent = `Processing Batch: ${batchName}...`;
+      document.getElementById('progress-subtext').textContent = 'Allocating orders & compacting partial sheets with guillotine cut line...';
+
+      try {
+        const res = await fetch('/api/run_batch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            batch_name: batchName,
+            order: orderQuantities,
+            sheet_w_mm: sheetW,
+            sheet_h_mm: sheetH,
+            kerf_mm: kerf,
+            margin_mm: margin
+          })
+        });
+
+        const result = await res.json();
+        overlay.style.display = 'none';
+
+        if (result.success) {
+          // Refresh batch list and select the new batch!
+          await loadBatches(result.batch_id);
+          switchView('viewer');
+        } else {
+          alert(`Batch nesting failed: ${result.error || 'Unknown error'}`);
+        }
+      } catch (err) {
+        overlay.style.display = 'none';
+        alert(`Error executing batch: ${err.message}`);
+      }
+    }
+
+    // =========================================================================
+    // SHEET INSPECTOR (VIEWER) LOGIC
+    // =========================================================================
+
+    async function loadBatches(selectBatchId = null) {
+      try {
+        const res = await fetch('/api/batches');
+        allBatches = await res.json();
+        renderBatchSelector();
+
+        if (allBatches.length > 0) {
+          if (selectBatchId) {
+            activeBatchId = selectBatchId;
+          } else if (!activeBatchId) {
+            activeBatchId = allBatches[0].batch_id;
+          }
+          document.getElementById('select-batch').value = activeBatchId;
+          renderActiveBatchSheets();
+        }
+      } catch (err) {
+        console.error('Failed to load batches:', err);
+      }
+    }
+
+    function renderBatchSelector() {
+      const sel = document.getElementById('select-batch');
+      sel.innerHTML = '';
+      allBatches.forEach(b => {
+        const opt = document.createElement('option');
+        opt.value = b.batch_id;
+        opt.textContent = `${b.batch_title} (${b.sheets_count} Sheets, ${b.total_parts} Parts)`;
+        sel.appendChild(opt);
+      });
+    }
+
+    function onBatchSelectChange() {
+      activeBatchId = document.getElementById('select-batch').value;
+      activeSheetIndex = 0;
+      renderActiveBatchSheets();
+    }
+
+    function renderActiveBatchSheets() {
+      const batch = allBatches.find(b => b.batch_id === activeBatchId);
+      const list = document.getElementById('sheet-list');
+      list.innerHTML = '';
+      if (!batch) return;
+
+      batch.sheets.forEach((sheet, idx) => {
+        const card = document.createElement('div');
+        card.className = `sheet-card ${idx === activeSheetIndex ? 'active' : ''}`;
+        card.onclick = () => selectSheet(idx);
+
+        const badgeHtml = sheet.is_partial
+          ? `<span class="badge badge-remnant">✂ Remnant (${sheet.remnant_dims || 'Trimmed'})</span>`
+          : `<span class="badge badge-full">Full Capacity</span>`;
+
+        card.innerHTML = `
+          <div class="card-top">
+            <span class="card-title">Sheet #${sheet.sheet_num}</span>
+            ${badgeHtml}
+          </div>
+          <div class="card-metrics">
+            <span><strong>${sheet.total_parts}</strong> parts</span>
+            <span>•</span>
+            <span style="font-family: var(--font-mono); font-size: 0.72rem; color: #64748b;">${sheet.filename}</span>
+          </div>
+        `;
+        list.appendChild(card);
+      });
+
+      loadCurrentSheet();
+    }
+
+    function selectSheet(idx) {
+      activeSheetIndex = idx;
+      renderActiveBatchSheets();
+    }
+
+    function prevSheet() {
+      const batch = allBatches.find(b => b.batch_id === activeBatchId);
+      if (batch && activeSheetIndex > 0) {
+        selectSheet(activeSheetIndex - 1);
+      }
+    }
+
+    function nextSheet() {
+      const batch = allBatches.find(b => b.batch_id === activeBatchId);
+      if (batch && activeSheetIndex < batch.sheets.length - 1) {
+        selectSheet(activeSheetIndex + 1);
+      }
+    }
+
+    async function loadCurrentSheet() {
+      const batch = allBatches.find(b => b.batch_id === activeBatchId);
+      if (!batch || !batch.sheets[activeSheetIndex]) return;
+      const sheet = batch.sheets[activeSheetIndex];
+
+      document.getElementById('stat-total-parts').textContent = `${sheet.total_parts} units`;
+
+      const cutBox = document.getElementById('stat-cut-box');
+      const remBox = document.getElementById('stat-remnant-box');
+      if (sheet.cut_x_mm) {
+        cutBox.style.display = 'flex';
+        document.getElementById('stat-cut-x').textContent = `X = ${sheet.cut_x_mm.toFixed(1)} mm`;
+      } else {
+        cutBox.style.display = 'none';
+      }
+
+      if (sheet.remnant_dims) {
+        remBox.style.display = 'flex';
+        document.getElementById('stat-remnant').textContent = sheet.remnant_dims;
+      } else {
+        remBox.style.display = 'none';
+      }
+
+      // Manifest Pills
+      const pillsContainer = document.getElementById('part-pills');
+      pillsContainer.innerHTML = '';
+      for (const [pname, count] of Object.entries(sheet.part_counts)) {
+        const pill = document.createElement('div');
+        pill.className = 'part-tag';
+        pill.innerHTML = `${pname}: <span>${count}</span>`;
+        pill.onclick = () => highlightPartsByName(pname);
+        pillsContainer.appendChild(pill);
+      }
+
+      // Fetch SVG
+      try {
+        const res = await fetch(sheet.svg_url);
+        const svgText = await res.text();
+        svgHost.innerHTML = svgText;
+
+        const svgEl = svgHost.querySelector('svg');
+        if (svgEl) {
+          wrapper.style.width = '600px';
+          wrapper.style.height = '1200px';
+
+          svgEl.querySelectorAll('.nested-part').forEach(part => {
+            part.addEventListener('mouseenter', (e) => {
+              const name = part.getAttribute('data-part') || part.getAttribute('data-part-name') || 'Part';
+              const id = part.id || '';
+              tooltip.style.display = 'block';
+              tooltip.innerHTML = `<strong>${name}</strong> (${id})`;
+            });
+            part.addEventListener('mousemove', (e) => {
+              tooltip.style.left = `${e.clientX + 14}px`;
+              tooltip.style.top = `${e.clientY + 14}px`;
+            });
+            part.addEventListener('mouseleave', () => {
+              tooltip.style.display = 'none';
+            });
+          });
+        }
+      } catch (err) {
+        console.error('Failed to load SVG:', err);
+      }
+
+      setTimeout(fitToScreen, 50);
+    }
+
+    function highlightPartsByName(partName) {
+      const svgEl = svgHost.querySelector('svg');
+      if (!svgEl) return;
+      svgEl.querySelectorAll('.nested-part').forEach(p => {
+        const name = p.getAttribute('data-part') || p.getAttribute('data-part-name') || '';
+        p.classList.toggle('highlighted', name === partName);
+      });
+    }
+
+    // Pan & Zoom Engine
     function updateTransform() {
       wrapper.style.transform = `translate(${panX}px, ${panY}px) scale(${scale})`;
       zoomText.textContent = `${Math.round(scale * 100)}%`;
@@ -696,7 +1644,6 @@ HTML_PAGE = """<!DOCTYPE html>
       updateTransform();
     }
 
-    // Mouse drag pan
     canvas.addEventListener('mousedown', (e) => {
       if (e.button !== 0) return;
       isDragging = true;
@@ -713,7 +1660,6 @@ HTML_PAGE = """<!DOCTYPE html>
 
     window.addEventListener('mouseup', () => { isDragging = false; });
 
-    // Scroll wheel zoom
     canvas.addEventListener('wheel', (e) => {
       e.preventDefault();
       const rect = canvas.getBoundingClientRect();
@@ -731,191 +1677,36 @@ HTML_PAGE = """<!DOCTYPE html>
 
     // Keyboard Shortcuts
     window.addEventListener('keydown', (e) => {
+      if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
       if (e.key === 'ArrowRight' || e.key === 'j') nextSheet();
       else if (e.key === 'ArrowLeft' || e.key === 'k') prevSheet();
       else if (e.key === 'f') fitToScreen();
       else if (e.key === '1') resetZoom();
       else if (e.key === '+' || e.key === '=') zoomIn();
       else if (e.key === '-') zoomOut();
-      else if (e.key === 'v') setViewMode(viewMode === 'svg' ? 'png' : 'svg');
     });
 
-    function setViewMode(mode) {
-      viewMode = mode;
-      document.getElementById('view-mode-svg').classList.toggle('active', mode === 'svg');
-      document.getElementById('view-mode-png').classList.toggle('active', mode === 'png');
-
-      const sheet = allSheets[currentSheetIndex];
-      if (!sheet) return;
-
-      if (mode === 'png' && sheet.has_png) {
-        svgHost.style.display = 'none';
-        imgHost.style.display = 'block';
-        imgHost.src = sheet.png_url;
-      } else {
-        svgHost.style.display = 'block';
-        imgHost.style.display = 'none';
-      }
+    async function refreshAll() {
+      await loadCatalogue();
+      await loadBatches();
     }
 
-    function renderSheetList() {
-      const list = document.getElementById('sheet-list');
-      list.innerHTML = '';
-
-      let currentGroup = '';
-      allSheets.forEach((sheet, idx) => {
-        if (sheet.condition_title !== currentGroup) {
-          currentGroup = sheet.condition_title;
-          const grp = document.createElement('div');
-          grp.className = 'condition-group-title';
-          grp.textContent = currentGroup;
-          list.appendChild(grp);
-        }
-
-        const card = document.createElement('div');
-        card.className = `sheet-card ${idx === currentSheetIndex ? 'active' : ''}`;
-        card.onclick = () => selectSheet(idx);
-
-        const badgeHtml = sheet.is_partial
-          ? `<span class="badge badge-remnant">✂ Remnant (${sheet.remnant_dims || 'Trimmed'})</span>`
-          : `<span class="badge badge-full">Full Capacity</span>`;
-
-        card.innerHTML = `
-          <div class="card-top">
-            <span class="card-title">Sheet #${sheet.sheet_num}</span>
-            ${badgeHtml}
-          </div>
-          <div class="card-metrics">
-            <span class="metric-item"><strong>${sheet.total_parts}</strong> parts</span>
-            <span>•</span>
-            <span class="metric-item" style="font-family: var(--font-mono); font-size: 0.72rem; color: #64748b;">${sheet.filename}</span>
-          </div>
-        `;
-        list.appendChild(card);
-      });
-
-      document.getElementById('sheet-count-badge').textContent = `${allSheets.length} Sheets`;
-    }
-
-    function selectSheet(index) {
-      if (index < 0 || index >= allSheets.length) return;
-      currentSheetIndex = index;
-      renderSheetList();
-      loadActiveSheet();
-    }
-
-    function prevSheet() {
-      if (currentSheetIndex > 0) selectSheet(currentSheetIndex - 1);
-    }
-
-    function nextSheet() {
-      if (currentSheetIndex < allSheets.length - 1) selectSheet(currentSheetIndex + 1);
-    }
-
-    async function loadActiveSheet() {
-      const sheet = allSheets[currentSheetIndex];
-      if (!sheet) return;
-
-      // Update Inspector Stats
-      document.getElementById('stat-total-parts').textContent = `${sheet.total_parts} units`;
-
-      const cutBox = document.getElementById('stat-cut-box');
-      const remBox = document.getElementById('stat-remnant-box');
-      if (sheet.cut_x_mm) {
-        cutBox.style.display = 'flex';
-        document.getElementById('stat-cut-x').textContent = `X = ${sheet.cut_x_mm.toFixed(1)} mm`;
-      } else {
-        cutBox.style.display = 'none';
-      }
-
-      if (sheet.remnant_dims) {
-        remBox.style.display = 'flex';
-        document.getElementById('stat-remnant').textContent = sheet.remnant_dims;
-      } else {
-        remBox.style.display = 'none';
-      }
-
-      // Update Manifest Pills
-      const pillsContainer = document.getElementById('part-pills');
-      pillsContainer.innerHTML = '';
-      for (const [pname, count] of Object.entries(sheet.part_counts)) {
-        const pill = document.createElement('div');
-        pill.className = 'part-tag';
-        pill.innerHTML = `${pname}: <span>${count}</span>`;
-        pillsContainer.appendChild(pill);
-      }
-
-      // Load SVG directly
-      try {
-        const res = await fetch(sheet.svg_url);
-        const svgText = await res.text();
-        svgHost.innerHTML = svgText;
-
-        const svgEl = svgHost.querySelector('svg');
-        if (svgEl) {
-          // Standardize display aspect
-          wrapper.style.width = '600px';
-          wrapper.style.height = '1200px';
-
-          // Attach hover handlers on nested parts
-          svgEl.querySelectorAll('.nested-part').forEach(part => {
-            part.addEventListener('mouseenter', (e) => {
-              const name = part.getAttribute('data-part') || part.getAttribute('data-part-name') || 'Part';
-              const id = part.id || '';
-              tooltip.style.display = 'block';
-              tooltip.innerHTML = `<strong>${name}</strong> (${id})`;
-            });
-            part.addEventListener('mousemove', (e) => {
-              tooltip.style.left = `${e.clientX + 14}px`;
-              tooltip.style.top = `${e.clientY + 14}px`;
-            });
-            part.addEventListener('mouseleave', () => {
-              tooltip.style.display = 'none';
-            });
-          });
-        }
-      } catch (err) {
-        console.error('Failed to load SVG:', err);
-      }
-
-      if (viewMode === 'png' && sheet.has_png) {
-        imgHost.src = sheet.png_url;
-        imgHost.style.display = 'block';
-        svgHost.style.display = 'none';
-      } else {
-        imgHost.style.display = 'none';
-        svgHost.style.display = 'block';
-      }
-
-      // Fit to screen on initial load
-      setTimeout(fitToScreen, 50);
-    }
-
-    async function loadBatches() {
-      try {
-        const res = await fetch('/api/batches');
-        allSheets = await res.json();
-        if (allSheets.length > 0) {
-          selectSheet(0);
-        }
-      } catch (err) {
-        console.error('Failed to load batches:', err);
-      }
-    }
-
-    // Auto-detect host IP
+    // Initialize
+    document.getElementById('input-batch-name').value = generateDefaultBatchName();
     document.getElementById('host-label').textContent = window.location.hostname;
-
-    // Initial load
-    loadBatches();
+    refreshAll();
   </script>
 </body>
 </html>
 """
 
 
+# ==============================================================================
+# HTTP REQUEST HANDLER
+# ==============================================================================
+
 class VisualizerRequestHandler(SimpleHTTPRequestHandler):
-    """Serves the single-page visualizer and live nesting batch API."""
+    """Serves the batch production studio, catalogue API, and live nesting execution."""
 
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -928,22 +1719,47 @@ class VisualizerRequestHandler(SimpleHTTPRequestHandler):
             self.wfile.write(HTML_PAGE.encode("utf-8"))
             return
 
+        elif path == "/api/catalogue":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            catalogue = get_catalogue()
+            self.wfile.write(json.dumps(catalogue).encode("utf-8"))
+            return
+
         elif path == "/api/batches":
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
-            batches = get_all_batches()
+            batches = get_all_batches_grouped()
             self.wfile.write(json.dumps(batches).encode("utf-8"))
             return
 
+        elif path.startswith("/parts/"):
+            # Serve individual part CAD SVGs for the catalogue preview
+            rel_path = path[len("/parts/"):]
+            local_path = os.path.join(PARTS_DIR, rel_path)
+            if not os.path.exists(local_path):
+                self.send_error(404, f"Part Not Found: {rel_path}")
+                return
+
+            self.send_response(200)
+            self.send_header("Content-Type", "image/svg+xml")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Cache-Control", "public, max-age=3600")
+            self.end_headers()
+            with open(local_path, "rb") as f:
+                self.wfile.write(f.read())
+            return
+
         elif path.startswith("/output/"):
-            # Serve files directly from the output directory
+            # Serve sheet SVGs and preview PNGs
             rel_path = path[len("/output/"):]
             local_path = os.path.join(OUTPUT_DIR, rel_path)
-
             if not os.path.exists(local_path):
-                self.send_error(404, f"File Not Found: {rel_path}")
+                self.send_error(404, f"Output File Not Found: {rel_path}")
                 return
 
             ext = os.path.splitext(local_path)[1].lower()
@@ -960,9 +1776,50 @@ class VisualizerRequestHandler(SimpleHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
-
             with open(local_path, "rb") as f:
                 self.wfile.write(f.read())
+            return
+
+        else:
+            self.send_error(404, "Not Found")
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+
+        if path == "/api/run_batch":
+            content_length = int(self.headers.get("Content-Length", 0))
+            body_bytes = self.rfile.read(content_length)
+            try:
+                data = json.loads(body_bytes.decode("utf-8"))
+                batch_name = data.get("batch_name", "")
+                order = data.get("order", {})
+                sheet_w = float(data.get("sheet_w_mm", 1220.0))
+                sheet_h = float(data.get("sheet_h_mm", 2440.0))
+                kerf = float(data.get("kerf_mm", 2.0))
+                margin = float(data.get("margin_mm", 5.0))
+
+                result = execute_production_batch(
+                    batch_name=batch_name,
+                    order=order,
+                    sheet_w_mm=sheet_w,
+                    sheet_h_mm=sheet_h,
+                    kerf_mm=kerf,
+                    margin_mm=margin
+                )
+
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(json.dumps(result).encode("utf-8"))
+
+            except Exception as e:
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": str(e)}).encode("utf-8"))
             return
 
         else:
@@ -975,7 +1832,14 @@ class ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
 
 def run_visualizer(port: int = PORT):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(PARTS_DIR, exist_ok=True)
     local_ip = get_local_ip()
+
+    # Pre-cache parts
+    try:
+        get_named_parts()
+    except Exception as e:
+        print(f"[*] Warning: Could not pre-cache parts: {e}")
 
     # Find free port if 8080 is busy
     actual_port = port
@@ -991,11 +1855,12 @@ def run_visualizer(port: int = PORT):
         sys.exit(1)
 
     print("\n" + "=" * 70)
-    print("      EASYNEST V2 - INDUSTRIAL BATCH & OUTPUT VISUALIZER")
+    print("   EASYNEST V2 - BATCH PRODUCTION STUDIO & VISUALIZER")
     print("=" * 70)
     print(f"[*] Local Access (this machine) : http://localhost:{actual_port}")
     print(f"[*] Network Access (your phone) : http://{local_ip}:{actual_port}")
-    print(f"[*] Monitoring outputs folder   : {OUTPUT_DIR}")
+    print(f"[*] CAD Parts Directory         : {PARTS_DIR}")
+    print(f"[*] Batch Outputs Directory     : {OUTPUT_DIR}")
     print("=" * 70)
     print("[*] Press Ctrl+C to stop the server.\n")
 

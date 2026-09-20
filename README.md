@@ -272,23 +272,39 @@ python3 batch_nest.py --run-all-tests
 
 ---
 
-## 🖥️ Local Batch & Output Visualizer (`visualizer.py`)
+## 🖥️ Local Batch Production Studio & Visualizer (`visualizer.py`)
 
-A zero-dependency local web visualizer to inspect nesting outputs, multi-sheet batches, and remnant cut lines directly on your device (no cloud, no npm, pure Python standard library):
+EasyNest v2 includes an interactive, zero-dependency local web studio and visualizer to configure production batches, browse CAD catalogues, execute live nesting, and inspect cut sheets directly from your desktop browser or mobile phone on the shop floor (no cloud, no npm, pure Python standard library):
 
 ```bash
-python3 visualizer.py
+# Start the studio server on port 8080
+python3 visualizer.py 8080
 ```
 
 - **Local Access**: `http://localhost:8080`
-- **Network / Mobile Access**: `http://<your-lan-ip>:8080`
-- **Features**:
-  - Interactive Vector SVG Pan & Zoom (drag to pan, scroll wheel / pinch to zoom)
-  - Toggle between native Vector SVG and Rendered PNG previews
-  - Part manifest inspector with live count tags and hover tooltips
-  - Automatic detection and visualization of Straight Guillotine Cut Lines and Reusable Remnant dimensions
-  - Keyboard navigation (`←` / `→` for sheets, `F` for fit-to-screen, `1` for 1:1, `V` for vector/png toggle)
-  - Dynamic live updates whenever new batch runs are executed
+- **Network / Mobile Access**: `http://<your-lan-ip>:8080` (e.g. `http://192.168.1.232:8080`)
+
+### Studio Features:
+1. **Interactive Product Catalogue**:
+   - Live vector preview cards for all 12 motorcycle CAD parts (`p01` through `p12`).
+   - Detailed part specs: bounding dimensions (W × H mm), internal cutout / hole counts, surface area in $\text{cm}^2$, and functional descriptions.
+   - Dynamic quantity steppers (`-`, `+`, manual input) directly on each product card.
+   - Quick Kit presets: *Quick 1-Kit BOM* (1 of each), *10-Set Batch* (10 of each), or *Reset All*.
+2. **Production Batch Configuration**:
+   - **Batch Name**: Custom identifier for shop work orders.
+   - **Sheet Dimensions**: Instant presets for Standard 4×8 ft (1220×2440 mm), 5×10 ft (1524×3048 mm), Metric Standard (1000×2000 mm), Prototyping (500×300 mm), or freeform custom width & height.
+   - **Cutting Parameters**: Real-time configurable laser/plasma Kerf (mm) and Sheet Margin (mm).
+   - **Live BOM Estimator**: Calculates total ordered parts and estimated net metal area before launching.
+3. **One-Click Live Batch Execution (`PROCESS BATCH`)**:
+   - Ingests the configured BOM and executes `MultiSheetBatchPlanner` across as many sheets as required.
+   - Compacts partial sheets and automatically plans straight single-pass guillotine shear cut lines.
+   - Generates production SVGs and PNG previews in `output/` with zero page reloads.
+4. **Interactive Sheet Inspector**:
+   - Side-by-side or tabbed multi-sheet navigation across all batches (both standard test conditions and user runs).
+   - Smooth pan & zoom canvas with mouse wheel, drag-to-pan, and mobile pinch-zoom support.
+   - Part breakdown sidebar with unit counts, percentage yields, and part hover highlighting.
+   - Guillotine cut line badge and reusable virgin remnant dimensions ($W \times H\text{ mm}$ and $\text{m}^2$).
+   - Full keyboard navigation: `←`/`→` for sheet browsing, `F` for fit-to-screen, `1` for 100% reset, `+`/`-` for zoom.
 
 
 
