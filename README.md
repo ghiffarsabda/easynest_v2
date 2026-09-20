@@ -270,6 +270,27 @@ python3 batch_nest.py --run-all-tests
 | **Condition 4: Mixed Assembly BOM Batch** | Full motorcycle BOM (25 Fairings, 25 Skid Plates, 25 Tail Tidies, 50 Grill Brackets, 100 Tags) | 4 | **225 units** | Sheets 1–3: 100% capacity.<br>Sheet 4: 7 units compacted vertically into left column ($X \le 316\text{ mm}$), **$889 \times 2430\text{ mm}$ ($2.16\text{ m}^2$, 73% of sheet) virgin remnant** preserved | ~58.2s |
 | **Condition 5: Rush Kanban Order** | 15 Skid plates (`p04`) + 20 Triple tree braces (`p08`) with remnant salvage | 1 | 35 units | 66.5% yield with **Guillotine Shear Line** @ $X = 1163\text{ mm}$ | ~18.5s |
 
+---
+
+## 🖥️ Local Batch & Output Visualizer (`visualizer.py`)
+
+A zero-dependency local web visualizer to inspect nesting outputs, multi-sheet batches, and remnant cut lines directly on your device (no cloud, no npm, pure Python standard library):
+
+```bash
+python3 visualizer.py
+```
+
+- **Local Access**: `http://localhost:8080`
+- **Network / Mobile Access**: `http://<your-lan-ip>:8080`
+- **Features**:
+  - Interactive Vector SVG Pan & Zoom (drag to pan, scroll wheel / pinch to zoom)
+  - Toggle between native Vector SVG and Rendered PNG previews
+  - Part manifest inspector with live count tags and hover tooltips
+  - Automatic detection and visualization of Straight Guillotine Cut Lines and Reusable Remnant dimensions
+  - Keyboard navigation (`←` / `→` for sheets, `F` for fit-to-screen, `1` for 1:1, `V` for vector/png toggle)
+  - Dynamic live updates whenever new batch runs are executed
+
+
 
 
 
