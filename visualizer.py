@@ -281,7 +281,7 @@ def execute_production_batch(
 # HTML, CSS & JAVASCRIPT FRONTEND APPLICATION
 # ==============================================================================
 
-HTML_PAGE = """<!DOCTYPE html>
+HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
@@ -439,7 +439,20 @@ HTML_PAGE = """<!DOCTYPE html>
       box-shadow: none;
     }
 
-    /* --- VIEW CONTAINERS --- */
+    /* --- VIEW CONTAINERS & FULL-PAGE SWITCHER --- */
+    body.mode-viewer {
+      overflow: hidden !important;
+    }
+    body.mode-viewer header.studio-header {
+      display: none !important;
+    }
+    body.mode-viewer #view-studio {
+      display: none !important;
+    }
+    body.mode-viewer #view-viewer {
+      display: flex !important;
+    }
+
     .view-container {
       display: none;
       flex: 1;
@@ -725,35 +738,233 @@ HTML_PAGE = """<!DOCTYPE html>
     .quick-btn:hover { background: #334155; color: white; }
 
     /* ==========================================================================
-       TAB 2: SHEET VISUALIZER (INSPECTOR)
+       FULL-PAGE SHEET INSPECTOR (OUTPUT VIEW)
        ========================================================================== */
-    aside {
-      width: 330px;
-      min-width: 280px;
-      background: #0c111e;
+    #view-viewer {
+      position: fixed;
+      inset: 0;
+      width: 100vw;
+      height: 100dvh;
+      overflow: hidden;
+      background: #05070d;
+      display: none;
+      z-index: 20;
+    }
+    #view-viewer.active {
+      display: flex;
+    }
+
+    .canvas-container {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      cursor: grab;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background-color: #060911;
+      background-image: radial-gradient(rgba(255, 255, 255, 0.06) 1px, transparent 0);
+      background-size: 26px 26px;
+    }
+    .canvas-container:active { cursor: grabbing; }
+
+    .sheet-wrapper {
+      position: absolute;
+      transform-origin: 0 0;
+      will-change: transform;
+      box-shadow: 0 25px 65px rgba(0, 0, 0, 0.75), 0 0 0 1px rgba(255, 255, 255, 0.12);
+      background: #ffffff;
+    }
+    #svg-host, #img-host {
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+    #svg-host svg {
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+
+    /* Nested part interactive highlight */
+    .nested-part {
+      transition: opacity 0.15s, stroke-width 0.15s;
+      cursor: pointer;
+    }
+    .nested-part:hover path {
+      stroke: #38bdf8 !important;
+      stroke-width: 80 !important;
+      fill-opacity: 0.75 !important;
+    }
+    .nested-part.highlighted path {
+      stroke: #f59e0b !important;
+      stroke-width: 95 !important;
+      fill: #f59e0b !important;
+      fill-opacity: 0.85 !important;
+    }
+
+    /* Floating Top HUD */
+    .inspector-top-hud {
+      position: absolute;
+      top: 12px;
+      left: 14px;
+      right: 14px;
+      z-index: 40;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.75rem;
+      padding: 0.45rem 0.85rem;
+      background: rgba(13, 19, 34, 0.90);
+      backdrop-filter: blur(14px);
+      -webkit-backdrop-filter: blur(14px);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      border-radius: 10px;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.55);
+      pointer-events: auto;
+    }
+    .hud-group {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      flex-wrap: nowrap;
+    }
+    .hud-title-box {
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      background: #111827;
+      padding: 0.3rem 0.7rem;
+      border-radius: 6px;
+      border: 1px solid #1f2937;
+    }
+    .sheet-title-text {
+      font-size: 0.85rem;
+      font-weight: 700;
+      color: #f9fafb;
+      white-space: nowrap;
+    }
+    .top-remnant-pill {
+      background: rgba(245, 158, 11, 0.16);
+      color: #fbbf24;
+      border: 1px solid rgba(245, 158, 11, 0.35);
+      font-size: 0.75rem;
+      font-weight: 700;
+      padding: 0.25rem 0.6rem;
+      border-radius: 6px;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      white-space: nowrap;
+    }
+    .pill-mini {
+      background: rgba(56, 189, 248, 0.15);
+      color: #38bdf8;
+      border: 1px solid rgba(56, 189, 248, 0.3);
+      font-size: 0.72rem;
+      font-weight: 700;
+      padding: 0.15rem 0.45rem;
+      border-radius: 9999px;
+      font-family: var(--font-mono);
+    }
+    .btn-icon {
+      background: #1e293b;
+      border: 1px solid #334155;
+      color: var(--text);
+      width: 32px;
+      height: 32px;
+      border-radius: 6px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      font-size: 0.85rem;
+      transition: all 0.15s ease;
+    }
+    .btn-icon:hover { background: #334155; border-color: #475569; }
+
+    /* Slide-over Drawer for Batches & Sheets */
+    .drawer-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.65);
+      backdrop-filter: blur(4px);
+      -webkit-backdrop-filter: blur(4px);
+      z-index: 90;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.2s ease;
+    }
+    .drawer-backdrop.open {
+      opacity: 1;
+      pointer-events: auto;
+    }
+    .sheet-drawer {
+      position: fixed;
+      top: 0;
+      left: 0;
+      bottom: 0;
+      width: 380px;
+      max-width: 88vw;
+      background: #0d1322;
       border-right: 1px solid var(--card-border);
+      z-index: 100;
       display: flex;
       flex-direction: column;
-      overflow: hidden;
+      transform: translateX(-100%);
+      transition: transform 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+      box-shadow: 12px 0 40px rgba(0, 0, 0, 0.7);
     }
-    .sidebar-header {
-      padding: 0.75rem 1rem;
+    .sheet-drawer.open {
+      transform: translateX(0);
+    }
+    .drawer-header {
+      padding: 1rem 1.2rem;
       border-bottom: 1px solid var(--card-border);
       display: flex;
-      flex-direction: column;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .drawer-title {
+      font-size: 1rem;
+      font-weight: 700;
+      color: #f9fafb;
+      display: flex;
+      align-items: center;
       gap: 0.5rem;
     }
-    .batch-select-label {
+    .drawer-close {
+      background: transparent;
+      border: none;
+      color: var(--text-dim);
+      font-size: 1.25rem;
+      cursor: pointer;
+      padding: 0.2rem 0.5rem;
+      border-radius: 4px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .drawer-close:hover { color: white; background: #1e293b; }
+    .drawer-content {
+      flex: 1;
+      overflow-y: auto;
+      padding: 1rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.9rem;
+    }
+    .drawer-label {
       font-size: 0.7rem;
       color: var(--text-dim);
       text-transform: uppercase;
       font-weight: 700;
       letter-spacing: 0.05em;
     }
+
     .sheet-list {
-      flex: 1;
-      overflow-y: auto;
-      padding: 0.75rem;
       display: flex;
       flex-direction: column;
       gap: 0.6rem;
@@ -812,37 +1023,13 @@ HTML_PAGE = """<!DOCTYPE html>
       color: var(--text-dim);
     }
 
-    /* Main Viewport */
-    main {
-      flex: 1;
-      display: flex;
-      flex-direction: column;
-      background: #070a12;
-      position: relative;
-      overflow: hidden;
-    }
-    .viewport-toolbar {
-      position: absolute;
-      top: 1rem;
-      right: 1rem;
-      z-index: 10;
-      display: flex;
-      align-items: center;
-      gap: 0.4rem;
-      background: rgba(17, 24, 39, 0.85);
-      backdrop-filter: blur(8px);
-      padding: 0.3rem 0.5rem;
-      border-radius: 8px;
-      border: 1px solid var(--card-border);
-      box-shadow: 0 4px 16px rgba(0,0,0,0.4);
-    }
     .toolbar-btn {
       background: transparent;
       border: none;
       color: var(--text);
-      width: 32px;
-      height: 32px;
-      border-radius: 6px;
+      width: 28px;
+      height: 28px;
+      border-radius: 4px;
       display: flex;
       align-items: center;
       justify-content: center;
@@ -854,76 +1041,51 @@ HTML_PAGE = """<!DOCTYPE html>
     .zoom-level-label {
       font-size: 0.75rem;
       font-family: var(--font-mono);
-      min-width: 52px;
+      min-width: 48px;
       text-align: center;
       color: var(--text-dim);
     }
 
-    .canvas-container {
-      flex: 1;
-      position: relative;
-      overflow: hidden;
-      cursor: grab;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      background-image: radial-gradient(rgba(255, 255, 255, 0.05) 1px, transparent 0);
-      background-size: 24px 24px;
-    }
-    .canvas-container:active { cursor: grabbing; }
-
-    .sheet-wrapper {
+    /* Floating Bottom Dock */
+    .inspector-bottom-dock {
       position: absolute;
-      transform-origin: 0 0;
-      will-change: transform;
-      box-shadow: 0 20px 50px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(255, 255, 255, 0.1);
-      background: #ffffff;
+      bottom: 12px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 40;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 0.4rem;
+      max-width: min(94vw, 1050px);
+      pointer-events: none;
+      transition: all 0.2s ease;
     }
-    #svg-host, #img-host {
-      width: 100%;
-      height: 100%;
-      display: block;
-    }
-    #svg-host svg {
-      width: 100%;
-      height: 100%;
-      display: block;
-    }
-
-    /* Nested part interactive highlight */
-    .nested-part {
-      transition: opacity 0.15s, stroke-width 0.15s;
-      cursor: pointer;
-    }
-    .nested-part:hover path {
-      stroke: #38bdf8 !important;
-      stroke-width: 80 !important;
-      fill-opacity: 0.75 !important;
-    }
-    .nested-part.highlighted path {
-      stroke: #f59e0b !important;
-      stroke-width: 90 !important;
-      fill: #f59e0b !important;
-      fill-opacity: 0.8 !important;
-    }
-
-    /* Inspector Drawer */
-    .inspector-drawer {
-      background: #0d1322;
-      border-top: 1px solid var(--card-border);
-      padding: 0.75rem 1.2rem;
+    .dock-bar {
+      pointer-events: auto;
+      background: rgba(13, 19, 34, 0.92);
+      backdrop-filter: blur(14px);
+      -webkit-backdrop-filter: blur(14px);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      border-radius: 10px;
+      padding: 0.45rem 0.9rem;
       display: flex;
       align-items: center;
-      justify-content: space-between;
-      gap: 1.5rem;
-      z-index: 10;
+      gap: 1rem;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.55);
+      flex-wrap: wrap;
+      justify-content: center;
     }
-    .stat-pill-group {
+    .inspector-bottom-dock.minimized .dock-details {
+      display: none !important;
+    }
+    .dock-details {
       display: flex;
       align-items: center;
       gap: 1rem;
       flex-wrap: wrap;
     }
+
     .stat-pill {
       display: flex;
       flex-direction: column;
@@ -950,7 +1112,7 @@ HTML_PAGE = """<!DOCTYPE html>
       align-items: center;
       gap: 0.4rem;
       flex-wrap: wrap;
-      max-width: 550px;
+      max-width: 580px;
     }
     .part-tag {
       background: #1e293b;
@@ -968,7 +1130,13 @@ HTML_PAGE = """<!DOCTYPE html>
       transition: all 0.15s;
     }
     .part-tag:hover { background: #334155; border-color: #38bdf8; }
+    .part-tag.active {
+      background: #0284c7;
+      border-color: #38bdf8;
+      color: white;
+    }
     .part-tag span { color: #38bdf8; font-weight: 700; }
+    .part-tag.active span { color: #ffffff; }
 
     /* Modal / Progress Overlay */
     #progress-overlay {
@@ -1021,31 +1189,22 @@ HTML_PAGE = """<!DOCTYPE html>
 </head>
 <body>
 
-  <!-- Top App Bar -->
-  <header>
+  <!-- Top App Bar (Only for Batch Studio) -->
+  <header id="studio-header" class="studio-header">
     <div class="brand">
       <span class="brand-badge">EASYNEST v2</span>
-      <span class="brand-title">Production Studio & Visualizer</span>
+      <span class="brand-title">Batch Production Studio</span>
       <div class="status-pill">
         <span class="status-dot"></span>
         <span id="host-label">Local Host</span>
       </div>
     </div>
 
-    <!-- Main View Switcher -->
-    <div class="tab-switcher">
-      <button id="tab-btn-studio" class="tab-btn active" onclick="switchView('studio')">
-        <span>📑</span> Batch Studio
-      </button>
-      <button id="tab-btn-viewer" class="tab-btn" onclick="switchView('viewer')">
-        <span>👁️</span> Sheet Inspector
-      </button>
-    </div>
-
     <div class="top-actions">
-      <button class="btn" onclick="prevSheet()" title="Previous Sheet (←)">◀ Prev</button>
-      <button class="btn" onclick="nextSheet()" title="Next Sheet (→)">Next ▶</button>
-      <button class="btn btn-accent" onclick="refreshAll()" title="Refresh All Data">↻ Refresh</button>
+      <button class="btn btn-accent" onclick="switchView('viewer')" title="Open Full-Page Sheet Inspector">
+        <span>👁️</span> Full-Page Sheet Inspector
+      </button>
+      <button class="btn" onclick="refreshAll()" title="Refresh All Data">↻ Refresh</button>
     </div>
   </header>
 
@@ -1150,46 +1309,82 @@ HTML_PAGE = """<!DOCTYPE html>
   </div>
 
   <!-- =======================================================================
-       TAB 2: SHEET INSPECTOR (INTERACTIVE CANVAS)
+       FULL-PAGE SHEET INSPECTOR
        ======================================================================= -->
   <div id="view-viewer" class="view-container">
 
-    <!-- Left Sidebar: Batch and Sheet Explorer -->
-    <aside>
-      <div class="sidebar-header">
-        <label class="batch-select-label" for="select-batch">Select Production Batch</label>
-        <select id="select-batch" class="form-control" onchange="onBatchSelectChange()">
-          <!-- Populated dynamically -->
-        </select>
-      </div>
+    <!-- Slide-over Drawer Backdrop -->
+    <div id="drawer-backdrop" class="drawer-backdrop" onclick="closeDrawer()"></div>
 
-      <div id="sheet-list" class="sheet-list">
-        <!-- Rendered dynamically -->
+    <!-- Slide-over Batches & Sheet Explorer Drawer -->
+    <div id="sheet-drawer" class="sheet-drawer">
+      <div class="drawer-header">
+        <div class="drawer-title">
+          <span>📦</span> Batches & Sheet Explorer
+        </div>
+        <button class="drawer-close" onclick="closeDrawer()" title="Close Drawer (Esc)">✕</button>
       </div>
-    </aside>
+      <div class="drawer-content">
+        <div>
+          <label class="drawer-label" for="select-batch">Select Production Batch</label>
+          <select id="select-batch" class="form-control" onchange="onBatchSelectChange()" style="margin-top: 4px;">
+            <!-- Populated dynamically -->
+          </select>
+        </div>
 
-    <!-- Main Viewport -->
-    <main>
-      <!-- Floating Viewport Controls -->
-      <div class="viewport-toolbar">
-        <button class="toolbar-btn" onclick="zoomIn()" title="Zoom In (+)">＋</button>
-        <span id="zoom-text" class="zoom-level-label">100%</span>
-        <button class="toolbar-btn" onclick="zoomOut()" title="Zoom Out (-)">－</button>
-        <button class="toolbar-btn" onclick="fitToScreen()" title="Fit Sheet to Window (F)">⛶</button>
-        <button class="toolbar-btn" onclick="resetZoom()" title="1:1 Pixel Scale (1)">1:1</button>
-      </div>
-
-      <!-- Pan & Zoom Canvas -->
-      <div id="canvas-container" class="canvas-container">
-        <div id="sheet-wrapper" class="sheet-wrapper">
-          <div id="svg-host"></div>
-          <img id="img-host" style="display: none;" alt="Preview" />
+        <div>
+          <label class="drawer-label">Sheets in Selected Batch</label>
+          <div id="sheet-list" class="sheet-list" style="margin-top: 6px;">
+            <!-- Rendered dynamically -->
+          </div>
         </div>
       </div>
+    </div>
 
-      <!-- Bottom Information Drawer -->
-      <div class="inspector-drawer">
-        <div class="stat-pill-group">
+    <!-- Edge-to-Edge Pan & Zoom Canvas -->
+    <div id="canvas-container" class="canvas-container">
+      <div id="sheet-wrapper" class="sheet-wrapper">
+        <div id="svg-host"></div>
+        <img id="img-host" style="display: none;" alt="Preview" />
+      </div>
+    </div>
+
+    <!-- Floating Top HUD -->
+    <div class="inspector-top-hud">
+      <div class="hud-group">
+        <button class="btn" onclick="switchView('studio')" title="Return to Batch Production Studio">
+          <span>← 🏭</span> Studio
+        </button>
+        <button class="btn btn-accent" onclick="toggleDrawer()" title="Browse Batches & Sheets (B)">
+          <span>☰</span> Batches & Sheets <span id="batch-sheet-pill" class="pill-mini">Sheet 1/1</span>
+        </button>
+      </div>
+
+      <div class="hud-group">
+        <button class="btn-icon" onclick="prevSheet()" title="Previous Sheet (←)">◀</button>
+        <div class="hud-title-box">
+          <span id="sheet-header-title" class="sheet-title-text">Loading Sheet...</span>
+        </div>
+        <button class="btn-icon" onclick="nextSheet()" title="Next Sheet (→)">▶</button>
+        <div id="top-remnant-pill" class="top-remnant-pill" style="display: none;"></div>
+      </div>
+
+      <div class="hud-group">
+        <div class="hud-group" style="background: #111827; padding: 2px 6px; border-radius: 6px; border: 1px solid #1f2937;">
+          <button class="toolbar-btn" onclick="zoomOut()" title="Zoom Out (-)">－</button>
+          <span id="zoom-text" class="zoom-level-label">100%</span>
+          <button class="toolbar-btn" onclick="zoomIn()" title="Zoom In (+)">＋</button>
+        </div>
+        <button class="btn" onclick="fitToScreen()" title="Fit to Screen (F)"><span>⛶</span> Fit</button>
+        <button class="btn" onclick="resetZoom()" title="1:1 Pixel Scale (1)">1:1</button>
+        <button id="btn-fullscreen" class="btn" onclick="toggleFullscreen()" title="Native Fullscreen Mode"><span>🖵</span> Fullscreen</button>
+      </div>
+    </div>
+
+    <!-- Floating Bottom Dock -->
+    <div id="inspector-bottom-dock" class="inspector-bottom-dock">
+      <div class="dock-bar">
+        <div class="dock-details">
           <div class="stat-pill">
             <span class="stat-label">Sheet Dimensions</span>
             <span id="stat-sheet-dims" class="stat-val">1220 × 2440 mm</span>
@@ -1199,24 +1394,24 @@ HTML_PAGE = """<!DOCTYPE html>
             <span id="stat-total-parts" class="stat-val emerald">-</span>
           </div>
           <div class="stat-pill" id="stat-cut-box" style="display: none;">
-            <span class="stat-label">✂ Guillotine Cut Line</span>
+            <span class="stat-label">✂ Guillotine Cut</span>
             <span id="stat-cut-x" class="stat-val amber">-</span>
           </div>
           <div class="stat-pill" id="stat-remnant-box" style="display: none;">
             <span class="stat-label">📦 Salvaged Remnant</span>
             <span id="stat-remnant" class="stat-val emerald">-</span>
           </div>
-        </div>
-
-        <div class="stat-pill">
-          <span class="stat-label">Sheet Part Breakdown</span>
-          <div id="part-pills" class="part-pills">
-            <!-- Rendered dynamically -->
+          <div class="stat-pill">
+            <span class="stat-label">Sheet Part Breakdown (Hover / Click to Highlight)</span>
+            <div id="part-pills" class="part-pills"></div>
           </div>
         </div>
-      </div>
 
-    </main>
+        <button id="btn-toggle-dock" class="btn" onclick="toggleBottomDock()" style="font-size: 0.75rem; padding: 0.25rem 0.6rem;">
+          ▼ Minimize
+        </button>
+      </div>
+    </div>
 
   </div>
 
@@ -1252,16 +1447,77 @@ HTML_PAGE = """<!DOCTYPE html>
     const zoomText = document.getElementById('zoom-text');
     const tooltip = document.getElementById('hover-tooltip');
 
-    // Tab Switching
-    function switchView(viewName) {
-      document.getElementById('view-studio').classList.toggle('active', viewName === 'studio');
-      document.getElementById('view-viewer').classList.toggle('active', viewName === 'viewer');
-      document.getElementById('tab-btn-studio').classList.toggle('active', viewName === 'studio');
-      document.getElementById('tab-btn-viewer').classList.toggle('active', viewName === 'viewer');
+    // View Switching (Full Page Studio vs Full Page Inspector)
+    function switchView(viewName, pushState = true) {
+      const isViewer = (viewName === 'viewer' || viewName === 'inspector');
+      document.body.classList.toggle('mode-viewer', isViewer);
+      document.getElementById('view-studio').classList.toggle('active', !isViewer);
+      document.getElementById('view-viewer').classList.toggle('active', isViewer);
 
-      if (viewName === 'viewer') {
-        setTimeout(fitToScreen, 50);
+      if (pushState) {
+        const targetPath = isViewer ? '/inspector' : '/';
+        if (window.location.pathname !== targetPath) {
+          window.history.pushState({ view: viewName }, '', targetPath);
+        }
       }
+
+      if (isViewer) {
+        setTimeout(fitToScreen, 60);
+      }
+    }
+
+    window.addEventListener('popstate', (e) => {
+      const path = window.location.pathname.toLowerCase();
+      const isViewer = path.includes('inspector') || path.includes('viewer');
+      switchView(isViewer ? 'viewer' : 'studio', false);
+    });
+
+    // Drawer Controls for Full-Page Inspector
+    function openDrawer() {
+      document.getElementById('sheet-drawer').classList.add('open');
+      document.getElementById('drawer-backdrop').classList.add('open');
+    }
+    function closeDrawer() {
+      document.getElementById('sheet-drawer').classList.remove('open');
+      document.getElementById('drawer-backdrop').classList.remove('open');
+    }
+    function toggleDrawer() {
+      const drawer = document.getElementById('sheet-drawer');
+      if (drawer.classList.contains('open')) {
+        closeDrawer();
+      } else {
+        openDrawer();
+      }
+    }
+
+    // Fullscreen Toggle
+    function toggleFullscreen() {
+      if (!document.fullscreenElement) {
+        document.documentElement.requestFullscreen().catch(() => {});
+      } else {
+        if (document.exitFullscreen) {
+          document.exitFullscreen();
+        }
+      }
+    }
+
+    document.addEventListener('fullscreenchange', () => {
+      const btn = document.getElementById('btn-fullscreen');
+      if (btn) {
+        btn.innerHTML = document.fullscreenElement ? '<span>🗗</span> Exit' : '<span>🖵</span> Fullscreen';
+      }
+      setTimeout(fitToScreen, 100);
+    });
+
+    // Bottom Dock Toggle
+    function toggleBottomDock() {
+      const dock = document.getElementById('inspector-bottom-dock');
+      dock.classList.toggle('minimized');
+      const toggleBtn = document.getElementById('btn-toggle-dock');
+      if (toggleBtn) {
+        toggleBtn.textContent = dock.classList.contains('minimized') ? '▲ Details' : '▼ Minimize';
+      }
+      setTimeout(fitToScreen, 60);
     }
 
     // Default Batch Name Generator
@@ -1379,7 +1635,6 @@ HTML_PAGE = """<!DOCTYPE html>
     function applyPreset(type) {
       orderQuantities = {};
       if (type === 'bom') {
-        // Complete 25 motorcycle BOM
         orderQuantities['p01_front_fairing'] = 25;
         orderQuantities['p04_engine_skid_plate'] = 25;
         orderQuantities['p05_tail_tidy_bracket'] = 25;
@@ -1427,7 +1682,7 @@ HTML_PAGE = """<!DOCTYPE html>
         overlay.style.display = 'none';
 
         if (result.success) {
-          // Refresh batch list and select the new batch!
+          // Refresh batch list, select new batch, and switch to Full-Page Inspector!
           await loadBatches(result.batch_id);
           switchView('viewer');
         } else {
@@ -1440,7 +1695,7 @@ HTML_PAGE = """<!DOCTYPE html>
     }
 
     // =========================================================================
-    // SHEET INSPECTOR (VIEWER) LOGIC
+    // FULL-PAGE SHEET INSPECTOR LOGIC
     // =========================================================================
 
     async function loadBatches(selectBatchId = null) {
@@ -1515,6 +1770,7 @@ HTML_PAGE = """<!DOCTYPE html>
     function selectSheet(idx) {
       activeSheetIndex = idx;
       renderActiveBatchSheets();
+      closeDrawer(); // Automatically close drawer so user inspects full-page sheet
     }
 
     function prevSheet() {
@@ -1536,6 +1792,23 @@ HTML_PAGE = """<!DOCTYPE html>
       if (!batch || !batch.sheets[activeSheetIndex]) return;
       const sheet = batch.sheets[activeSheetIndex];
 
+      // Update Top Floating HUD
+      const totalSheets = batch.sheets.length;
+      document.getElementById('sheet-header-title').textContent = `${batch.batch_title} — Sheet ${sheet.sheet_num} of ${totalSheets}`;
+      document.getElementById('batch-sheet-pill').textContent = `Sheet ${sheet.sheet_num}/${totalSheets}`;
+
+      const remnantPill = document.getElementById('top-remnant-pill');
+      if (sheet.cut_x_mm && sheet.remnant_dims) {
+        remnantPill.style.display = 'inline-flex';
+        remnantPill.innerHTML = `✂ Cut @ X = ${sheet.cut_x_mm.toFixed(1)} mm • Remnant: ${sheet.remnant_dims}`;
+      } else if (sheet.cut_x_mm) {
+        remnantPill.style.display = 'inline-flex';
+        remnantPill.innerHTML = `✂ Cut @ X = ${sheet.cut_x_mm.toFixed(1)} mm`;
+      } else {
+        remnantPill.style.display = 'none';
+      }
+
+      // Update Bottom Dock Metrics
       document.getElementById('stat-total-parts').textContent = `${sheet.total_parts} units`;
 
       const cutBox = document.getElementById('stat-cut-box');
@@ -1560,12 +1833,13 @@ HTML_PAGE = """<!DOCTYPE html>
       for (const [pname, count] of Object.entries(sheet.part_counts)) {
         const pill = document.createElement('div');
         pill.className = 'part-tag';
+        pill.setAttribute('data-name', pname);
         pill.innerHTML = `${pname}: <span>${count}</span>`;
         pill.onclick = () => highlightPartsByName(pname);
         pillsContainer.appendChild(pill);
       }
 
-      // Fetch SVG
+      // Fetch SVG & Dynamically Calculate Native Aspect Ratio
       try {
         const res = await fetch(sheet.svg_url);
         const svgText = await res.text();
@@ -1573,8 +1847,26 @@ HTML_PAGE = """<!DOCTYPE html>
 
         const svgEl = svgHost.querySelector('svg');
         if (svgEl) {
-          wrapper.style.width = '600px';
-          wrapper.style.height = '1200px';
+          const vb = svgEl.getAttribute('viewBox');
+          let sheetW = 1220;
+          let sheetH = 2440;
+          if (vb) {
+            const parts = vb.trim().split(/[\s,]+/).map(Number);
+            if (parts.length === 4 && parts[2] > 0 && parts[3] > 0) {
+              sheetW = parts[2];
+              sheetH = parts[3];
+            }
+          }
+          // Set wrapper dimensions proportional to real sheet aspect ratio
+          const baseW = 1000;
+          const baseH = Math.round((sheetH / sheetW) * baseW);
+          wrapper.style.width = `${baseW}px`;
+          wrapper.style.height = `${baseH}px`;
+
+          // Format dimensions for display
+          const displayW = Math.round(sheetW / 100);
+          const displayH = Math.round(sheetH / 100);
+          document.getElementById('stat-sheet-dims').textContent = `${displayW} × ${displayH} mm`;
 
           svgEl.querySelectorAll('.nested-part').forEach(part => {
             part.addEventListener('mouseenter', (e) => {
@@ -1596,15 +1888,21 @@ HTML_PAGE = """<!DOCTYPE html>
         console.error('Failed to load SVG:', err);
       }
 
-      setTimeout(fitToScreen, 50);
+      setTimeout(fitToScreen, 60);
     }
 
     function highlightPartsByName(partName) {
       const svgEl = svgHost.querySelector('svg');
       if (!svgEl) return;
+      const alreadyActive = document.querySelector(`.part-tag.active[data-name="${partName}"]`);
+
+      document.querySelectorAll('.part-tag').forEach(tag => {
+        tag.classList.toggle('active', !alreadyActive && tag.getAttribute('data-name') === partName);
+      });
+
       svgEl.querySelectorAll('.nested-part').forEach(p => {
         const name = p.getAttribute('data-part') || p.getAttribute('data-part-name') || '';
-        p.classList.toggle('highlighted', name === partName);
+        p.classList.toggle('highlighted', !alreadyActive && name === partName);
       });
     }
 
@@ -1633,16 +1931,24 @@ HTML_PAGE = """<!DOCTYPE html>
 
     function fitToScreen() {
       if (!wrapper.offsetWidth || !wrapper.offsetHeight) return;
-      const pad = 40;
-      const availW = canvas.clientWidth - pad * 2;
-      const availH = canvas.clientHeight - pad * 2;
+      const isMobile = window.innerWidth < 768;
+      const padX = isMobile ? 16 : 48;
+      const padY = isMobile ? 65 : 75; // accounts for floating top HUD and bottom dock
+      const availW = canvas.clientWidth - padX * 2;
+      const availH = canvas.clientHeight - padY * 2;
       const scaleX = availW / wrapper.offsetWidth;
       const scaleY = availH / wrapper.offsetHeight;
-      scale = Math.min(scaleX, scaleY, 1.5);
+      scale = Math.min(scaleX, scaleY, 4.0);
       panX = (canvas.clientWidth - wrapper.offsetWidth * scale) / 2;
       panY = (canvas.clientHeight - wrapper.offsetHeight * scale) / 2;
       updateTransform();
     }
+
+    window.addEventListener('resize', () => {
+      if (document.body.classList.contains('mode-viewer')) {
+        fitToScreen();
+      }
+    });
 
     canvas.addEventListener('mousedown', (e) => {
       if (e.button !== 0) return;
@@ -1678,9 +1984,11 @@ HTML_PAGE = """<!DOCTYPE html>
     // Keyboard Shortcuts
     window.addEventListener('keydown', (e) => {
       if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
-      if (e.key === 'ArrowRight' || e.key === 'j') nextSheet();
+      if (e.key === 'Escape') closeDrawer();
+      else if (e.key === 'b' || e.key === 'B') toggleDrawer();
+      else if (e.key === 'ArrowRight' || e.key === 'j') nextSheet();
       else if (e.key === 'ArrowLeft' || e.key === 'k') prevSheet();
-      else if (e.key === 'f') fitToScreen();
+      else if (e.key === 'f' || e.key === 'F') fitToScreen();
       else if (e.key === '1') resetZoom();
       else if (e.key === '+' || e.key === '=') zoomIn();
       else if (e.key === '-') zoomOut();
@@ -1691,10 +1999,23 @@ HTML_PAGE = """<!DOCTYPE html>
       await loadBatches();
     }
 
-    // Initialize
+    // Initialize Page & Route
+    const currentPath = window.location.pathname.toLowerCase();
+    const urlParams = new URLSearchParams(window.location.search);
+    const startInViewer = urlParams.get('view') === 'viewer' || 
+      urlParams.get('view') === 'inspector' || 
+      currentPath.includes('inspector') || 
+      currentPath.includes('viewer');
+
     document.getElementById('input-batch-name').value = generateDefaultBatchName();
     document.getElementById('host-label').textContent = window.location.hostname;
-    refreshAll();
+
+    async function init() {
+      await loadCatalogue();
+      await loadBatches();
+      switchView(startInViewer ? 'viewer' : 'studio', false);
+    }
+    init();
   </script>
 </body>
 </html>
@@ -1708,11 +2029,21 @@ HTML_PAGE = """<!DOCTYPE html>
 class VisualizerRequestHandler(SimpleHTTPRequestHandler):
     """Serves the batch production studio, catalogue API, and live nesting execution."""
 
+    def do_HEAD(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+        if path in ("/", "/index.html", "/inspector", "/viewer", "/studio"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            return
+        super().do_HEAD()
+
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path
 
-        if path in ("/", "/index.html"):
+        if path in ("/", "/index.html", "/inspector", "/viewer", "/studio"):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
