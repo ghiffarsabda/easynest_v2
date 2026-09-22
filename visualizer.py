@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-EasyNest v2 - Interactive Batch Production Studio & Visualizer
+EasyNest v3 - Interactive Batch Production Studio & Visualizer
 =============================================================
 A lightweight, zero-dependency local web application to:
 1. Browse the CAD Product Catalogue (12 realistic motorcycle components).
@@ -469,7 +469,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>EasyNest v2 — Production Batch Studio & Visualizer</title>
+  <title>EasyNest v3 — Production Batch Studio & Visualizer</title>
   <style>
     :root {
       --bg: #090d16;
@@ -1277,7 +1277,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <!-- Top App Bar (Only for Batch Studio) -->
   <header id="studio-header" class="studio-header">
     <div class="brand">
-      <span class="brand-badge">EASYNEST v2</span>
+      <span class="brand-badge">EASYNEST v3</span>
       <span class="brand-title">Batch Production Studio</span>
       <div class="status-pill">
         <span class="status-dot"></span>
@@ -2423,7 +2423,7 @@ def run_visualizer(port: int = PORT):
         sys.exit(1)
 
     print("\n" + "=" * 70)
-    print("   EASYNEST V2 - BATCH PRODUCTION STUDIO & VISUALIZER")
+    print("   EASYNEST V3 - BATCH PRODUCTION STUDIO & VISUALIZER")
     print("=" * 70)
     print(f"[*] Local Access (this machine) : http://localhost:{actual_port}")
     print(f"[*] Network Access (your phone) : http://{local_ip}:{actual_port}")

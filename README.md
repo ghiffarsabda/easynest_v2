@@ -1,4 +1,4 @@
-# CDR to SVG Converter & Geometry Enhancer (EasyNest v2)
+# CDR to SVG Converter & Geometry Enhancer (EasyNest v3)
 
 A Python tool that converts CorelDRAW (`.cdr`) drawings into clean, enhanced SVG files. It detects and repairs edge gaps (open/disconnected lines) and reconstructs the geometry into **perfectly isolated objects with internal holes (cutouts/voids) isolated**.
 
@@ -150,7 +150,7 @@ python3 industrial_nest.py windshield.svg "GAR TURBO D.cdr" \
 
 ## 🧠 TypeSafe Jev System One AI Intelligence Integration
 
-EasyNest v2 integrates **TypeSafe's Jev Foundation Model** ([docs.typesafe.ai](https://docs.typesafe.ai)) for sub-50ms calibrated industrial judgments across 5 core pillars where deterministic algorithms fall short:
+EasyNest v3 integrates **TypeSafe's Jev Foundation Model** ([docs.typesafe.ai](https://docs.typesafe.ai)) for sub-50ms calibrated industrial judgments across 5 core pillars where deterministic algorithms fall short:
 
 ### The 5 Active Jev Pillars:
 
@@ -204,7 +204,7 @@ python3 industrial_nest.py windshield.svg "GAR TURBO D.cdr" \
 
 ## 🏍️ Realistic Motorcycle Parts CAD Library (`parts/`)
 
-EasyNest v2 includes a parametric library of 12 realistic CAD motorcycle components (`generate_parts.py`) spanning three production tiers with genuine industrial geometry: curvature blends, mounting apertures, lightening pockets, and cooling louvers.
+EasyNest v3 includes a parametric library of 12 realistic CAD motorcycle components (`generate_parts.py`) spanning three production tiers with genuine industrial geometry: curvature blends, mounting apertures, lightening pockets, and cooling louvers.
 
 | Tier | Part ID & Filename | Description | Dimensions (mm) | Features & Holes |
 |:---|:---|:---|:---|:---|
@@ -274,7 +274,7 @@ python3 batch_nest.py --run-all-tests
 
 ## 🖥️ Local Batch Production Studio & Visualizer (`visualizer.py`)
 
-EasyNest v2 includes an interactive, zero-dependency local web studio and visualizer to configure production batches, browse CAD catalogues, execute live nesting, and inspect cut sheets directly from your desktop browser or mobile phone on the shop floor (no cloud, no npm, pure Python standard library):
+EasyNest v3 includes an interactive, zero-dependency local web studio and visualizer to configure production batches, browse CAD catalogues, execute live nesting, and inspect cut sheets directly from your desktop browser or mobile phone on the shop floor (no cloud, no npm, pure Python standard library):
 
 ```bash
 # Start the studio server on port 8080

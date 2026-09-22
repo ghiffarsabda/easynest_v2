@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Motorcycle Parts SVG Generator (EasyNest v2)
+Motorcycle Parts SVG Generator (EasyNest v3)
 ============================================
 Generates 12 realistic CAD-grade motorcycle vector components with exact
 closed cubic Beziers, internal mounting apertures, slots, and topological voids:

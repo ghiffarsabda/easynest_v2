@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Multi-Sheet Industrial Batch Nesting & Pairing Solver (EasyNest v2)
+Multi-Sheet Industrial Batch Nesting & Pairing Solver (EasyNest v3)
 ===================================================================
 Orchestrates multi-sheet production runs across a warehouse inventory of 122x244cm sheets:
 
@@ -1075,7 +1075,7 @@ def solve_tight_ideal_mixed_nesting(
 def run_all_5_test_conditions():
     """Runs and self-evaluates all 5 production conditions."""
     print("\n" + "#" * 80)
-    print("      EASYNEST V2 - INDUSTRIAL MOTORCYCLE TEST SUITE (5 CONDITIONS)")
+    print("      EASYNEST V3 - INDUSTRIAL MOTORCYCLE TEST SUITE (5 CONDITIONS)")
     print("#" * 80)
 
     # 1. Ingest 12 Parts

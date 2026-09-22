@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Industrial Nesting CLI Tool (EasyNest v2)
+Industrial Nesting CLI Tool (EasyNest v3)
 =========================================
 Performs 2D irregular true-shape nesting with max-fit optimization.
 Supports CorelDRAW (.cdr) and SVG (.svg) input files, single-part and multi-part mixed nesting,

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-EasyNest v2 - Jev (TypeSafe AI) System One Intelligence Integration
+EasyNest v3 - Jev (TypeSafe AI) System One Intelligence Integration
 ===================================================================
 Connects EasyNest to TypeSafe's Jev-latest System One foundation model
 (https://docs.typesafe.ai) for sub-50ms calibrated industrial judgments:
