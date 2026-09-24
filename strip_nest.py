@@ -316,12 +316,12 @@ class StripNestingEngine:
             'xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">',
             '  <defs>',
             '    <style>',
-            '      .strip-plate { fill: #0f172a; stroke: #334155; stroke-width: 40; }',
-            '      .usable-margin { fill: none; stroke: #38bdf8; stroke-dasharray: 160,160; stroke-width: 25; }',
-            '      .shear-line { stroke: #ef4444; stroke-dasharray: 250,150; stroke-width: 80; }',
-            '      .shear-badge { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 320px; font-weight: bold; fill: #ef4444; }',
-            '      .part-path { vector-effect: non-scaling-stroke; stroke-linejoin: round; stroke-linecap: round; }',
-            '      .part-label { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 150px; font-weight: 800; fill: #ffffff; pointer-events: none; }',
+            '      .strip-plate { fill: #f8fafc; stroke: #64748b; stroke-width: 40; }',
+            '      .usable-margin { fill: none; stroke: #cbd5e1; stroke-dasharray: 120,120; stroke-width: 20; }',
+            '      .shear-line { stroke: #ef4444; stroke-dasharray: 200,100; stroke-width: 50; }',
+            '      .shear-badge { font-family: sans-serif; font-size: 260px; font-weight: bold; fill: #dc2626; }',
+            '      .part-path { stroke-linejoin: round; stroke-linecap: round; }',
+            '      .part-label { font-family: sans-serif; font-size: 130px; font-weight: bold; fill: #0f172a; pointer-events: none; }',
             '    </style>',
             '  </defs>',
             f'  <!-- Continuous Strip Stock ({strip_len_mm:.1f} x {strip_w_mm:.1f} mm) -->',
@@ -364,7 +364,7 @@ class StripNestingEngine:
             lines.append(f'  <g id="part_{idx}_{part.part_id}" class="nested-part" data-part="{part.part_id}" data-part-name="{part.part_id}">')
             lines.append(
                 f'    <path class="part-path" d="{compound_d}" '
-                f'fill="{fill_c}" fill-opacity="{opacity}" stroke="{stroke_c}" stroke-width="35" fill-rule="evenodd" />'
+                f'fill="{fill_c}" fill-opacity="0.4" stroke="{stroke_c}" stroke-width="25" fill-rule="evenodd" />'
             )
 
             # Center label

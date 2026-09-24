@@ -243,12 +243,13 @@ def parse_sheet_metadata(svg_path: str) -> Dict[str, Any]:
         "cond4_assembly_bom": "Condition 4: Mixed Assembly BOM (225 Parts)",
         "cond5_rush_kanban": "Condition 5: Rush Kanban (35 Parts)"
     }
-    if batch_id in friendly_batch_titles:
-        batch_title = friendly_batch_titles[batch_id]
+    clean_batch_id = batch_id[:-6] if batch_id.endswith("_strip") else batch_id
+    if clean_batch_id in friendly_batch_titles:
+        batch_title = friendly_batch_titles[clean_batch_id]
         if is_strip:
             batch_title = f"📏 Strip: {batch_title}"
     elif is_strip:
-        batch_title = f"📏 Strip: {batch_id.replace('_', ' ').title()}"
+        batch_title = f"📏 Strip: {clean_batch_id.replace('_', ' ').title()}"
     elif is_fill and fill_info:
         batch_title = f"⚡ Fill: {fill_info['primary_name']} + {fill_info['filler_name']}"
     else:
@@ -1290,6 +1291,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
       padding: 1rem 1.5rem;
       overflow: auto;
       background: #090d16;
+    }
+    .viewer-canvas-area.is-strip-view {
+      justify-content: flex-start !important;
+      align-items: flex-start !important;
+      padding: 1rem 1rem;
     }
     .sheet-paper {
       background: #ffffff;
@@ -2383,10 +2389,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
         const svgText = await res.text();
         svgHost.innerHTML = svgText;
 
-        const isStrip = !!(sheet.is_strip || (sheet.viewbox && parseFloat(sheet.viewbox.split(' ')[2]) / parseFloat(sheet.viewbox.split(' ')[3]) > 2.2));
+        const isStrip = !!(sheet.is_strip || (sheet.viewbox && parseFloat(sheet.viewbox.split(' ')[2]) / parseFloat(sheet.viewbox.split(' ')[3]) > 2.0));
         const paper = document.querySelector('.sheet-paper');
+        const canvasArea = document.querySelector('.viewer-canvas-area');
         if (paper) paper.classList.toggle('is-strip-view', isStrip);
         if (svgHost) svgHost.classList.toggle('is-strip-view', isStrip);
+        if (canvasArea) canvasArea.classList.toggle('is-strip-view', isStrip);
         resetZoom();
 
         const svgEl = svgHost.querySelector('svg');
@@ -2395,6 +2403,22 @@ HTML_PAGE = r"""<!DOCTYPE html>
           if (vb) {
             const parts = vb.trim().split(/[\s,]+/).map(Number);
             if (parts.length === 4 && parts[2] > 0 && parts[3] > 0) {
+              const vbW = parts[2];
+              const vbH = parts[3];
+              const ratio = vbW / vbH;
+              if (isStrip || ratio > 2.0) {
+                const targetH = Math.max(540, window.innerHeight - 200);
+                const targetW = Math.round(targetH * ratio);
+                svgEl.style.height = `${targetH}px`;
+                svgEl.style.width = `${targetW}px`;
+                svgEl.style.minWidth = `${targetW}px`;
+                svgEl.style.maxWidth = 'none';
+              } else {
+                svgEl.style.height = '';
+                svgEl.style.width = '';
+                svgEl.style.minWidth = '';
+                svgEl.style.maxWidth = '';
+              }
               const displayW = Math.round(parts[2] / 100);
               const displayH = Math.round(parts[3] / 100);
               document.getElementById('stat-sheet-dims').textContent = `${displayW} × ${displayH} mm`;
