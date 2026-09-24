@@ -361,7 +361,7 @@ class StripNestingEngine:
             if t_holes:
                 compound_d += ' ' + ' '.join(h.to_svg_d() for h in t_holes)
 
-            lines.append(f'  <g id="part_{idx}_{part.part_id}" class="nested-part" data-part="{part.part_id}" data-part-name="{part.part_id}">')
+            lines.append(f'  <g id="part_{idx}_{part.part_id}" class="nested-part" data-part="{part.part_id}">')
             lines.append(
                 f'    <path class="part-path" d="{compound_d}" '
                 f'fill="{fill_c}" fill-opacity="0.4" stroke="{stroke_c}" stroke-width="25" fill-rule="evenodd" />'

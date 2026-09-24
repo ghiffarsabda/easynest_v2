@@ -166,8 +166,17 @@ def parse_sheet_metadata(svg_path: str) -> Dict[str, Any]:
     with open(svg_path, "r", encoding="utf-8", errors="replace") as f:
         content = f.read()
 
-    # Parse part names and counts
-    parts = re.findall(r'data-part(?:-name)?="([^"]+)"', content)
+    # Parse part names and counts (ensure exactly one count per placed part element)
+    part_elements = re.findall(r'<g [^>]*class="nested-part"[^>]*>', content)
+    parts = []
+    for tag in part_elements:
+        m = re.search(r'data-part(?:-name)?="([^"]+)"', tag)
+        if m:
+            parts.append(m.group(1))
+    # Fallback for SVGs with non-standard group wrapper
+    if not parts:
+        parts = re.findall(r'\bdata-part="([^"]+)"', content) or re.findall(r'\bdata-part-name="([^"]+)"', content)
+
     part_counts: Dict[str, int] = {}
     for p in parts:
         part_counts[p] = part_counts.get(p, 0) + 1
