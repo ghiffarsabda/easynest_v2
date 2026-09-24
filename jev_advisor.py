@@ -20,6 +20,10 @@ import urllib.error
 from dataclasses import dataclass, field
 from typing import Dict, Any, List, Optional, Tuple
 
+import numpy as np
+from shapely.geometry import Polygon, box
+from shapely import affinity, STRtree
+
 TYPESAFE_API_URL = "https://api.typesafe.ai/v1/systemone"
 DEFAULT_MODEL = "jev-latest"
 
@@ -48,7 +52,21 @@ class JevSystemOneClient:
     """Lightweight, zero-dependency client for TypeSafe AI's Jev model."""
 
     def __init__(self, api_key: Optional[str] = None):
-        self.api_key = api_key or os.environ.get("TYPESAFE_API_KEY", "")
+        if not api_key:
+            api_key = os.environ.get("TYPESAFE_API_KEY", "")
+        if not api_key:
+            env_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+            if os.path.exists(env_file):
+                try:
+                    with open(env_file, "r") as f:
+                        for line in f:
+                            line = line.strip()
+                            if line.startswith("TYPESAFE_API_KEY="):
+                                api_key = line.split("=", 1)[1].strip().strip('"').strip("'")
+                                break
+                except Exception:
+                    pass
+        self.api_key = api_key or ""
         self.is_live = bool(self.api_key and len(self.api_key.strip()) > 5)
 
     def query(self, state: str, questions: Dict[str, Any], model: str = DEFAULT_MODEL) -> Dict[str, Any]:
@@ -119,6 +137,22 @@ class JevSystemOneClient:
                         chosen = "cad_artifact"
                     else:
                         chosen = "outer_boundary"
+                elif "refinement_action" in q_id:
+                    if "rotate_outlier_horizontal" in keys and ("vertical" in state_lower or "tall" in state_lower or "protrusion" in state_lower):
+                        chosen = "rotate_outlier_horizontal"
+                    elif "rotate_outlier_vertical" in keys and ("wide" in state_lower or "lateral" in state_lower):
+                        chosen = "rotate_outlier_vertical"
+                    elif "compact_inward" in keys and ("corridor" in state_lower or "gap" in state_lower):
+                        chosen = "compact_inward"
+                    else:
+                        chosen = "approve_layout" if "approve_layout" in keys else keys[0]
+                elif "decision" in q_id:
+                    if "good_enough_stop" in keys and ("good enough" in state_lower or "approved" in state_lower or "clean" in state_lower or "optimal" in state_lower or "semifinal output #2" in state_lower or "semifinal output #3" in state_lower):
+                        chosen = "good_enough_stop"
+                    elif "refine_further" in keys and ("protrusion" in state_lower or "outlier" in state_lower or "semifinal output #1" in state_lower):
+                        chosen = "refine_further"
+                    else:
+                        chosen = "good_enough_stop" if "good_enough_stop" in keys else keys[0]
                 else:
                     chosen = keys[0] if keys else "default"
 
@@ -137,6 +171,8 @@ class JevSystemOneClient:
                     score_val = 0.8 if "acrylic" in state_lower else 1.9
                 elif "inventory_salvage" in q_id:
                     score_val = 65.0
+                elif "layout_compactness" in q_id:
+                    score_val = 1.2 if ("protrusion" in state_lower or "tall outlier" in state_lower or "ruining remnant" in state_lower) else 4.2
                 else:
                     score_val = 3.5
                 answers[q_id] = {
@@ -475,6 +511,548 @@ class JevNestingAdvisor:
         }
         return self.client.query(state, questions)
 
+    # --------------------------------------------------------------------------
+    # Pillar 6: Iterative Semifinal Layout Review & Heuristic Refinement
+    # --------------------------------------------------------------------------
+    def advise_semifinal_layout_review(
+        self,
+        iteration: int,
+        sheet_dims_mm: Tuple[float, float],
+        envelope_dims_mm: Tuple[float, float],
+        remnant_dims_mm: Tuple[float, float],
+        total_parts: int,
+        parts_summary: str,
+        outlier_desc: str,
+        remnant_area_m2: float = 0.0
+    ) -> Dict[str, Any]:
+        """
+        Pillar 6: Evaluates a semifinal nesting candidate layout.
+        Decides whether layout quality is optimal ('good_enough_stop') or requires geometric
+        transformations (e.g. rotating an isolated vertical outlier to horizontal)
+        to minimize envelope and maximize continuous reusable remnant plate.
+        """
+        state = (
+            f"Semifinal Output #{iteration}. Sheet: {sheet_dims_mm[0]:.1f}x{sheet_dims_mm[1]:.1f}mm. "
+            f"Total Parts Placed: {total_parts} ({parts_summary}). "
+            f"Current Pack Envelope: Width={envelope_dims_mm[0]:.1f}mm, Height={envelope_dims_mm[1]:.1f}mm. "
+            f"Reusable Remnant Corridor: {remnant_dims_mm[0]:.1f}x{remnant_dims_mm[1]:.1f}mm ({remnant_area_m2:.3f} m²). "
+            f"Boundary & Outlier Analysis: {outlier_desc}."
+        )
+        questions = {
+            "layout_compactness": {
+                "type": "score",
+                "instructions": "Rate current sheet layout compactness from 0 (isolated protrusion wasting remnant plate) to 5 (tight optimal pack).",
+                "criteria": [
+                    "0: Isolated tall protrusion ruining remnant plate",
+                    "1: Multiple jagged outliers",
+                    "2: Moderate compaction with uneven edge",
+                    "3: Clean rectangular boundary with minor gaps",
+                    "4: Tight cluster with minimal excess envelope",
+                    "5: Optimal boundary compaction"
+                ]
+            },
+            "refinement_action": {
+                "type": "choice",
+                "instructions": "Select the best geometry refinement action to minimize envelope and maximize salvaged remnant space:",
+                "criteria": {
+                    "approve_layout": "Layout is optimal; approve as final production sheet",
+                    "rotate_outlier_horizontal": "Rotate vertical tall outlier horizontally to drop top boundary",
+                    "rotate_outlier_vertical": "Rotate wide lateral outlier vertically to narrow lateral boundary",
+                    "compact_inward": "Pull boundary parts inward into interior corridors"
+                }
+            },
+            "decision": {
+                "type": "choice",
+                "instructions": "Heuristic stopping decision for this iteration:",
+                "criteria": {
+                    "refine_further": "Continue refinement into next semifinal output",
+                    "good_enough_stop": "Current layout is good enough, terminate loop"
+                }
+            }
+        }
+        return self.client.query(state, questions)
+
+
+# ==============================================================================
+# Jev Layout Refiner & Heuristic Stopping Engine
+# ==============================================================================
+
+class JevLayoutRefiner:
+    """
+    Executes iterative heuristic review and geometric refinement powered by TypeSafe Jev System One.
+    Takes Semifinal Output 1 -> asks Jev to review -> executes recommended transformations
+    -> gets Semifinal Output 2 -> asks Jev again -> stops when Jev decides 'good_enough_stop'.
+    """
+
+    def __init__(
+        self,
+        sheet_w_mm: float,
+        sheet_h_mm: float,
+        kerf_mm: float = 2.0,
+        margin_mm: float = 5.0,
+        scale: float = 100.0,
+        jev_advisor: Optional[JevNestingAdvisor] = None
+    ):
+        self.sheet_w_mm = sheet_w_mm
+        self.sheet_h_mm = sheet_h_mm
+        self.kerf_mm = kerf_mm
+        self.margin_mm = margin_mm
+        self.scale = scale
+        self.sheet_w = sheet_w_mm * scale
+        self.sheet_h = sheet_h_mm * scale
+        self.kerf = kerf_mm * scale
+        self.margin = margin_mm * scale
+        self.usable_min_x = self.margin
+        self.usable_min_y = self.margin
+        self.usable_max_x = self.sheet_w - self.margin
+        self.usable_max_y = self.sheet_h - self.margin
+        self.jev_advisor = jev_advisor or JevNestingAdvisor()
+
+    def analyze_layout(self, sheet_placed: List[Any], named_parts: Optional[List[Tuple[str, Any]]] = None) -> Dict[str, Any]:
+        """Analyzes bounding envelope, top/right outliers, and remnant corridor geometry."""
+        if not sheet_placed:
+            return {}
+
+        max_x = max(p.polygon.bounds[2] for p in sheet_placed)
+        max_y = max(p.polygon.bounds[3] for p in sheet_placed)
+        min_x = min(p.polygon.bounds[0] for p in sheet_placed)
+        min_y = min(p.polygon.bounds[1] for p in sheet_placed)
+
+        env_w_mm = max_x / self.scale
+        env_h_mm = max_y / self.scale
+
+        # Sort by top edge (Y)
+        top_sorted = sorted(sheet_placed, key=lambda p: p.polygon.bounds[3], reverse=True)
+        top_1st = top_sorted[0]
+        top_1st_y = top_1st.polygon.bounds[3]
+        top_2nd_y = top_sorted[1].polygon.bounds[3] if len(top_sorted) > 1 else top_1st_y
+        delta_top_mm = (top_1st_y - top_2nd_y) / self.scale
+        top_w_mm = (top_1st.polygon.bounds[2] - top_1st.polygon.bounds[0]) / self.scale
+        top_h_mm = (top_1st.polygon.bounds[3] - top_1st.polygon.bounds[1]) / self.scale
+        top_is_tall = top_h_mm > (top_w_mm * 1.15)
+
+        # Sort by right edge (X)
+        right_sorted = sorted(sheet_placed, key=lambda p: p.polygon.bounds[2], reverse=True)
+        right_1st = right_sorted[0]
+        right_1st_x = right_1st.polygon.bounds[2]
+        right_2nd_x = right_sorted[1].polygon.bounds[2] if len(right_sorted) > 1 else right_1st_x
+        delta_right_mm = (right_1st_x - right_2nd_x) / self.scale
+        right_w_mm = (right_1st.polygon.bounds[2] - right_1st.polygon.bounds[0]) / self.scale
+        right_h_mm = (right_1st.polygon.bounds[3] - right_1st.polygon.bounds[1]) / self.scale
+        right_is_wide = right_w_mm > (right_h_mm * 1.15)
+
+        # Remnant corridor estimation
+        rem_h_w = self.sheet_w_mm
+        rem_h_h = max(0.0, self.sheet_h_mm - env_h_mm - 15.0)
+        rem_h_m2 = (rem_h_w * rem_h_h) / 1e6
+
+        rem_v_w = max(0.0, self.sheet_w_mm - env_w_mm - 15.0)
+        rem_v_h = max(0.0, self.sheet_h_mm - 2 * self.margin_mm)
+        rem_v_m2 = (rem_v_w * rem_v_h) / 1e6
+
+        if rem_h_m2 >= rem_v_m2:
+            rem_dims_mm = (rem_h_w, rem_h_h)
+            rem_m2 = rem_h_m2
+        else:
+            rem_dims_mm = (rem_v_w, rem_v_h)
+            rem_m2 = rem_v_m2
+
+        # Formulate part summary
+        counts: Dict[str, int] = {}
+        for p in sheet_placed:
+            name = named_parts[p.part_index][0] if named_parts and p.part_index < len(named_parts) else f"part_{p.part_index}"
+            counts[name] = counts.get(name, 0) + 1
+        summary_str = ", ".join([f"{k}: {v}" for k, v in counts.items()])
+
+        # Internal Pack Density & Interstitial Void Analysis
+        parts_area_cm2 = sum(p.polygon.area for p in sheet_placed) / (self.scale ** 2) / 100.0
+        envelope_area_cm2 = (env_w_mm * env_h_mm) / 100.0
+        pack_density_pct = (parts_area_cm2 / envelope_area_cm2) * 100.0 if envelope_area_cm2 > 0 else 0.0
+
+        # Check internal row voids
+        has_internal_row_gaps = False
+        row_gap_warning = ""
+        if len(sheet_placed) >= 8:
+            ys_unique = sorted(list(set(round(p.polygon.bounds[1] / self.scale, 1) for p in sheet_placed)))
+            if len(ys_unique) >= 3:
+                y_diffs = [ys_unique[i+1] - ys_unique[i] for i in range(len(ys_unique) - 1)]
+                median_y_step = float(np.median(y_diffs))
+                typical_part_h = float(np.median([(p.polygon.bounds[3] - p.polygon.bounds[1]) / self.scale for p in sheet_placed]))
+                if median_y_step > typical_part_h * 1.5:
+                    has_internal_row_gaps = True
+                    gap_size_mm = median_y_step - typical_part_h
+                    row_gap_warning = f" | WARNING: Internal row void anomaly! Rows are spaced {median_y_step:.1f}mm apart for a {typical_part_h:.1f}mm tall part (~{gap_size_mm:.1f}mm empty gap between each row, density {pack_density_pct:.1f}%)."
+
+        # Formulate outlier state for Jev
+        top_name = named_parts[top_1st.part_index][0] if named_parts and top_1st.part_index < len(named_parts) else f"part_{top_1st.part_index}"
+        if delta_top_mm >= 30.0 and top_is_tall:
+            outlier_desc = (
+                f"Part '{top_name}' (idx {top_1st.part_index}) is oriented vertically "
+                f"({top_w_mm:.0f}x{top_h_mm:.0f}mm, ang={top_1st.angle:.0f}°) and sticks out alone to Y={env_h_mm:.0f}mm, "
+                f"protruding {delta_top_mm:.0f}mm past the 2nd highest part ({top_2nd_y/self.scale:.0f}mm), "
+                f"restricting reusable remnant plate to {rem_h_h:.0f}mm height.{row_gap_warning}"
+            )
+        elif delta_right_mm >= 30.0 and right_is_wide:
+            right_name = named_parts[right_1st.part_index][0] if named_parts and right_1st.part_index < len(named_parts) else f"part_{right_1st.part_index}"
+            outlier_desc = (
+                f"Part '{right_name}' (idx {right_1st.part_index}) is oriented horizontally "
+                f"({right_w_mm:.0f}x{right_h_mm:.0f}mm) and sticks out laterally to X={env_w_mm:.0f}mm, "
+                f"protruding {delta_right_mm:.0f}mm past the 2nd rightmost part, restricting reusable lateral corridor.{row_gap_warning}"
+            )
+        else:
+            if has_internal_row_gaps:
+                outlier_desc = f"Boundary envelope appears clean ({env_w_mm:.0f}x{env_h_mm:.0f}mm), BUT{row_gap_warning}"
+            else:
+                outlier_desc = (
+                    f"Clean boundary profile; top protrusion is minimal ({delta_top_mm:.1f}mm), "
+                    f"lateral protrusion is minimal ({delta_right_mm:.1f}mm), pack density is {pack_density_pct:.1f}%. No isolated outliers or internal voids."
+                )
+
+        return {
+            'total_parts': len(sheet_placed),
+            'parts_summary': summary_str,
+            'env_w_mm': env_w_mm,
+            'env_h_mm': env_h_mm,
+            'rem_dims_mm': rem_dims_mm,
+            'rem_m2': rem_m2,
+            'top_1st': top_1st,
+            'top_1st_y': top_1st_y,
+            'top_2nd_y': top_2nd_y,
+            'delta_top_mm': delta_top_mm,
+            'top_is_tall': top_is_tall,
+            'top_w_mm': top_w_mm,
+            'top_h_mm': top_h_mm,
+            'right_1st': right_1st,
+            'right_1st_x': right_1st_x,
+            'right_2nd_x': right_2nd_x,
+            'delta_right_mm': delta_right_mm,
+            'right_is_wide': right_is_wide,
+            'right_w_mm': right_w_mm,
+            'right_h_mm': right_h_mm,
+            'outlier_desc': outlier_desc
+        }
+
+    def execute_refinement(
+        self,
+        sheet_placed: List[Any],
+        named_parts: List[Tuple[str, Any]],
+        action_choice: str,
+        analysis: Dict[str, Any]
+    ) -> Tuple[Optional[List[Any]], str]:
+        """
+        Executes the geometric refinement transformation directed by Jev:
+        - 'rotate_outlier_horizontal': Rotates tall top outlier 90 deg and docks into lower space.
+        - 'rotate_outlier_vertical': Rotates wide right outlier 90 deg and docks inward.
+        - 'compact_inward': Pulls boundary parts inward into empty interior gaps.
+        """
+        from industrial_nest import PlacedInstance
+
+        if action_choice == "rotate_outlier_horizontal":
+            target = analysis['top_1st']
+            top_1st_y = analysis['top_1st_y']
+            top_2nd_y = analysis['top_2nd_y']
+            top_h_mm = analysis['top_h_mm']
+
+            raw_poly = named_parts[target.part_index][1].outer_path.polygon
+            alt_angles = [round((target.angle + 90.0) % 360, 1), round((target.angle + 270.0) % 360, 1)]
+
+            fixed_instances = [p for p in sheet_placed if p is not target]
+            fixed_bufs = [p.buffered_polygon for p in fixed_instances]
+            tree = STRtree(fixed_bufs)
+
+            best_placement = None
+            best_new_max_y = top_1st_y
+
+            for test_ang in alt_angles:
+                prot = affinity.rotate(raw_poly, test_ang, origin='center')
+                mnx, mny, mxx, mxy = prot.bounds
+                p_norm = affinity.translate(prot, -mnx, -mny)
+                pw, ph = mxx - mnx, mxy - mny
+
+                # Verify that height is actually smaller
+                if ph >= top_h_mm * self.scale * 0.95:
+                    continue
+
+                b_norm = p_norm.buffer(self.kerf / 2.0)
+
+                # Candidate anchor points
+                cand_xs = sorted(list(set(
+                    [self.usable_min_x] +
+                    [p.polygon.bounds[0] for p in fixed_instances] +
+                    [p.polygon.bounds[2] + self.kerf for p in fixed_instances]
+                )))
+                cand_xs = [x for x in cand_xs if self.usable_min_x <= x <= self.usable_max_x - pw]
+
+                cand_ys = sorted(list(set(
+                    [self.usable_min_y] +
+                    [p.polygon.bounds[1] for p in fixed_instances] +
+                    [p.polygon.bounds[3] + self.kerf for p in fixed_instances]
+                )))
+                # Only check Y that would yield lower top boundary
+                cand_ys = [y for y in cand_ys if self.usable_min_y <= y and (y + ph) < top_1st_y]
+
+                for cy in cand_ys:
+                    cand_top = max(top_2nd_y, cy + ph)
+                    if cand_top >= best_new_max_y:
+                        continue
+                    for cx in cand_xs:
+                        cand_b = affinity.translate(b_norm, cx, cy)
+                        hits = tree.query(cand_b)
+                        if any(cand_b.intersection(fixed_bufs[h]).area > 1.0 for h in hits):
+                            continue
+                        # Found better placement
+                        best_new_max_y = cand_top
+                        best_placement = (cx, cy, test_ang, p_norm, b_norm)
+                        break
+
+            if best_placement:
+                cx, cy, ang, p_norm, b_norm = best_placement
+                new_p = affinity.translate(p_norm, cx, cy)
+                new_b = affinity.translate(b_norm, cx, cy)
+                new_inst = PlacedInstance(target.part_index, ang, cx, cy, new_p, new_b)
+                saved_mm = (top_1st_y - best_new_max_y) / self.scale
+                notes = (
+                    f"Rotated Part #{target.part_index} horizontally ({ang:.0f}°) at "
+                    f"X={cx/self.scale:.1f}mm, Y={cy/self.scale:.1f}mm; lowered top envelope by {saved_mm:.1f} mm"
+                )
+                return fixed_instances + [new_inst], notes
+
+        elif action_choice == "rotate_outlier_vertical":
+            target = analysis['right_1st']
+            right_1st_x = analysis['right_1st_x']
+            right_2nd_x = analysis['right_2nd_x']
+            right_w_mm = analysis['right_w_mm']
+
+            raw_poly = named_parts[target.part_index][1].outer_path.polygon
+            alt_angles = [round((target.angle + 90.0) % 360, 1), round((target.angle + 270.0) % 360, 1)]
+
+            fixed_instances = [p for p in sheet_placed if p is not target]
+            fixed_bufs = [p.buffered_polygon for p in fixed_instances]
+            tree = STRtree(fixed_bufs)
+
+            best_placement = None
+            best_new_max_x = right_1st_x
+
+            for test_ang in alt_angles:
+                prot = affinity.rotate(raw_poly, test_ang, origin='center')
+                mnx, mny, mxx, mxy = prot.bounds
+                p_norm = affinity.translate(prot, -mnx, -mny)
+                pw, ph = mxx - mnx, mxy - mny
+
+                if pw >= right_w_mm * self.scale * 0.95:
+                    continue
+
+                b_norm = p_norm.buffer(self.kerf / 2.0)
+
+                cand_ys = sorted(list(set(
+                    [self.usable_min_y] +
+                    [p.polygon.bounds[1] for p in fixed_instances] +
+                    [p.polygon.bounds[3] + self.kerf for p in fixed_instances]
+                )))
+                cand_ys = [y for y in cand_ys if self.usable_min_y <= y <= self.usable_max_y - ph]
+
+                cand_xs = sorted(list(set(
+                    [self.usable_min_x] +
+                    [p.polygon.bounds[0] for p in fixed_instances] +
+                    [p.polygon.bounds[2] + self.kerf for p in fixed_instances]
+                )))
+                cand_xs = [x for x in cand_xs if self.usable_min_x <= x and (x + pw) < right_1st_x]
+
+                for cx in cand_xs:
+                    cand_right = max(right_2nd_x, cx + pw)
+                    if cand_right >= best_new_max_x:
+                        continue
+                    for cy in cand_ys:
+                        cand_b = affinity.translate(b_norm, cx, cy)
+                        hits = tree.query(cand_b)
+                        if any(cand_b.intersection(fixed_bufs[h]).area > 1.0 for h in hits):
+                            continue
+                        best_new_max_x = cand_right
+                        best_placement = (cx, cy, test_ang, p_norm, b_norm)
+                        break
+
+            if best_placement:
+                cx, cy, ang, p_norm, b_norm = best_placement
+                new_p = affinity.translate(p_norm, cx, cy)
+                new_b = affinity.translate(b_norm, cx, cy)
+                new_inst = PlacedInstance(target.part_index, ang, cx, cy, new_p, new_b)
+                saved_mm = (right_1st_x - best_new_max_x) / self.scale
+                notes = (
+                    f"Rotated Part #{target.part_index} vertically ({ang:.0f}°) at "
+                    f"X={cx/self.scale:.1f}mm, Y={cy/self.scale:.1f}mm; narrowed lateral envelope by {saved_mm:.1f} mm"
+                )
+                return fixed_instances + [new_inst], notes
+
+        elif action_choice == "compact_inward":
+            # Slide top outlier down into lowest available valid gap
+            target = analysis['top_1st']
+            fixed_instances = [p for p in sheet_placed if p is not target]
+            fixed_bufs = [p.buffered_polygon for p in fixed_instances]
+            tree = STRtree(fixed_bufs)
+
+            raw_poly = named_parts[target.part_index][1].outer_path.polygon
+            prot = affinity.rotate(raw_poly, target.angle, origin='center')
+            mnx, mny, mxx, mxy = prot.bounds
+            p_norm = affinity.translate(prot, -mnx, -mny)
+            pw, ph = mxx - mnx, mxy - mny
+            b_norm = p_norm.buffer(self.kerf / 2.0)
+
+            cand_ys = sorted(list(set(
+                [self.usable_min_y] +
+                [p.polygon.bounds[1] for p in fixed_instances] +
+                [p.polygon.bounds[3] + self.kerf for p in fixed_instances]
+            )))
+            cand_ys = [y for y in cand_ys if self.usable_min_y <= y and (y + ph) < target.polygon.bounds[3]]
+
+            cand_xs = sorted(list(set(
+                [self.usable_min_x] +
+                [p.polygon.bounds[0] for p in fixed_instances] +
+                [p.polygon.bounds[2] + self.kerf for p in fixed_instances]
+            )))
+            cand_xs = [x for x in cand_xs if self.usable_min_x <= x <= self.usable_max_x - pw]
+
+            for cy in cand_ys:
+                for cx in cand_xs:
+                    cand_b = affinity.translate(b_norm, cx, cy)
+                    hits = tree.query(cand_b)
+                    if any(cand_b.intersection(fixed_bufs[h]).area > 1.0 for h in hits):
+                        continue
+                    new_p = affinity.translate(p_norm, cx, cy)
+                    new_inst = PlacedInstance(target.part_index, target.angle, cx, cy, new_p, cand_b)
+                    saved_mm = (target.polygon.bounds[3] - (cy + ph)) / self.scale
+                    notes = f"Compacted Part #{target.part_index} inward to Y={cy/self.scale:.1f}mm (saved {saved_mm:.1f}mm)"
+                    return fixed_instances + [new_inst], notes
+
+        return None, "No collision-free improvement found"
+
+    def refine_layout_with_jev(
+        self,
+        sheet_placed: List[Any],
+        named_parts: List[Tuple[str, Any]],
+        sheet_no: int = 1,
+        max_iterations: int = 4
+    ) -> Tuple[List[Any], List[Dict[str, Any]], str]:
+        """
+        Runs the full Jev review loop:
+        Semifinal 1 -> Jev Review -> Refinement Transformation -> Semifinal 2 -> Jev Review
+        ... terminates when Jev decides 'good_enough_stop' or max_iterations is reached.
+        """
+        print("\n" + "=" * 80)
+        print(f"       TYPESAFE JEV SYSTEM ONE - PILLAR 6: SEMIFINAL LAYOUT REVIEW")
+        print("=" * 80)
+        print(f"  Target Sheet   : Sheet #{sheet_no} ({self.sheet_w_mm:.0f} x {self.sheet_h_mm:.0f} mm)")
+        print(f"  Initial Parts  : {len(sheet_placed)} placed units")
+        print("-" * 80)
+
+        current_placed = list(sheet_placed)
+        history: List[Dict[str, Any]] = []
+        final_verdict = "Approved"
+
+        best_layout = list(sheet_placed)
+        best_rem_m2 = 0.0
+        visited_signatures = set()
+
+        for it in range(1, max_iterations + 1):
+            analysis = self.analyze_layout(current_placed, named_parts)
+            if not analysis:
+                break
+
+            total_parts = analysis['total_parts']
+            parts_summary = analysis['parts_summary']
+            env_w = analysis['env_w_mm']
+            env_h = analysis['env_h_mm']
+            rem_w, rem_h = analysis['rem_dims_mm']
+            rem_m2 = analysis['rem_m2']
+            outlier_desc = analysis['outlier_desc']
+
+            # Track best candidate by remnant salvage plate
+            if rem_m2 > best_rem_m2:
+                best_rem_m2 = rem_m2
+                best_layout = list(current_placed)
+
+            # Cycle / Equilibrium detection
+            sig = (round(env_w, 0), round(env_h, 0))
+            if sig in visited_signatures:
+                final_verdict = f"Good Enough (Jev Equilibrium: {best_rem_m2:.3f} m² Remnant)"
+                print(f"\n[+] JEV HEURISTIC STOP: Layout reached equilibrium cycle on Semifinal #{it}. Jev selected best layout ({best_rem_m2:.3f} m² remnant).")
+                current_placed = best_layout
+                break
+            visited_signatures.add(sig)
+
+            print(f"\n[*] [Jev Review Iteration #{it}] Evaluating Semifinal Output #{it}...")
+            print(f"    Current Envelope  : W={env_w:.1f} mm | H={env_h:.1f} mm")
+            print(f"    Salvaged Remnant  : {rem_w:.1f} x {rem_h:.1f} mm ({rem_m2:.3f} m²)")
+            print(f"    Outlier State     : {outlier_desc}")
+
+            review = self.jev_advisor.advise_semifinal_layout_review(
+                iteration=it,
+                sheet_dims_mm=(self.sheet_w_mm, self.sheet_h_mm),
+                envelope_dims_mm=(env_w, env_h),
+                remnant_dims_mm=(rem_w, rem_h),
+                total_parts=total_parts,
+                parts_summary=parts_summary,
+                outlier_desc=outlier_desc,
+                remnant_area_m2=rem_m2
+            )
+
+            score_info = review.get("layout_compactness", {})
+            action_info = review.get("refinement_action", {})
+            decision_info = review.get("decision", {})
+
+            compact_score = score_info.get("score", 3.5)
+            action_choice = action_info.get("choice", "approve_layout")
+            action_conf = action_info.get("confidence", 0.85)
+            decision_choice = decision_info.get("choice", "good_enough_stop")
+            decision_conf = decision_info.get("confidence", 0.80)
+
+            print(f"    -> Jev Compactness Rating : {compact_score:.1f} / 5.0")
+            print(f"    -> Jev Action Advice      : {action_choice} (Confidence: {action_conf*100:.0f}%)")
+            print(f"    -> Jev Stopping Decision  : {decision_choice} (Confidence: {decision_conf*100:.0f}%)")
+
+            hist_item: Dict[str, Any] = {
+                "iteration": it,
+                "semifinal_version": f"Semifinal Output #{it}",
+                "envelope_mm": [round(env_w, 1), round(env_h, 1)],
+                "remnant_dims_mm": [round(rem_w, 1), round(rem_h, 1)],
+                "remnant_m2": round(rem_m2, 3),
+                "compactness_score": round(compact_score, 2),
+                "action_choice": action_choice,
+                "action_confidence": round(action_conf, 2),
+                "decision": decision_choice,
+                "decision_confidence": round(decision_conf, 2),
+                "outlier_desc": outlier_desc
+            }
+            history.append(hist_item)
+
+            # Heuristic stopping condition
+            if decision_choice == "good_enough_stop" or action_choice == "approve_layout":
+                final_verdict = f"Good Enough (Approved by Jev on Semifinal #{it})"
+                print(f"\n[+] JEV HEURISTIC STOP: Jev decided layout #{it} is 'GOOD ENOUGH'. Finalizing production sheet.")
+                break
+
+            # If Jev requests refinement, execute transformation
+            print(f"[*] Executing Jev Refinement: '{action_choice}'...")
+            refined_placed, action_notes = self.execute_refinement(
+                current_placed, named_parts, action_choice, analysis
+            )
+
+            if refined_placed is not None:
+                new_max_y = max(p.polygon.bounds[3] for p in refined_placed) / self.scale
+                saved_y = env_h - new_max_y
+                print(f"[+] Transformation Succeeded: {action_notes}")
+                print(f"    Envelope Height Drop: {env_h:.1f} mm -> {new_max_y:.1f} mm (Saved {saved_y:.1f} mm!)")
+                print(f"[+] Semifinal Output #{it + 1} generated. Submitting back to Jev for re-review...")
+                current_placed = refined_placed
+                hist_item["transformation_applied"] = action_notes
+                hist_item["height_saved_mm"] = round(saved_y, 1)
+            else:
+                print(f"[!] Refinement '{action_choice}' could not find collision-free improvement. Jev accepting current layout.")
+                final_verdict = f"Good Enough (Best Physical Fit Achieved on Semifinal #{it})"
+                break
+
+        print("=" * 80 + "\n")
+        return current_placed, history, final_verdict
+
 
 # ==============================================================================
 # Self-Test Verification
@@ -507,4 +1085,20 @@ if __name__ == "__main__":
     print(f"  Thermal Risk Score (0-3)    : {thermal_res['thermal_distortion_risk']['score']:.1f}")
     print(f"  Assist Gas Recommendation   : {thermal_res['air_assist_gas_recommendation']['choice']}")
     print(f"  Burnthrough Hazard Noul     : {thermal_res['bridge_burnthrough_hazard']['noul']:.2f}")
+
+    # Pillar 6 Test: Semifinal Layout Review
+    review_res = advisor.advise_semifinal_layout_review(
+        iteration=1,
+        sheet_dims_mm=(1220.0, 2440.0),
+        envelope_dims_mm=(850.0, 1780.0),
+        remnant_dims_mm=(1220.0, 660.0),
+        total_parts=8,
+        parts_summary="p05_tail_tidy_bracket: 8",
+        outlier_desc="Part #7 is oriented vertically (150x420mm) and sticks out alone to Y=1780mm, protruding 530mm past the 2nd highest part (1250mm), ruining remnant plate.",
+        remnant_area_m2=0.805
+    )
+    print("\n[Pillar 6: Semifinal Layout Review & Heuristic Stop]")
+    print(f"  Compactness Score (0-5)     : {review_res['layout_compactness']['score']:.1f}")
+    print(f"  Jev Refinement Action Advice: {review_res['refinement_action']['choice']}")
+    print(f"  Jev Stopping Decision       : {review_res['decision']['choice']}")
     print("\nAll Jev pillars verified successfully!")

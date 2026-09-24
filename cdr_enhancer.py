@@ -518,11 +518,15 @@ def build_isolated_objects(closed_paths: List[CurvePath]) -> List[IsolatedObject
     for i in range(n):
         poly_child = valid_paths[i].polygon
         # Find smallest container
+        minx_c, miny_c, maxx_c, maxy_c = poly_child.bounds
         smallest_parent_idx = None
         smallest_parent_area = float('inf')
-
         for j in range(n):
             if i != j and valid_paths[j].area > valid_paths[i].area:
+                minx_p, miny_p, maxx_p, maxy_p = valid_paths[j].polygon.bounds
+                # Fast AABB rejection: parent box must completely enclose child box
+                if minx_p > minx_c or miny_p > miny_c or maxx_p < maxx_c or maxy_p < maxy_c:
+                    continue
                 poly_parent = valid_paths[j].polygon
                 # Use contains or covers
                 if poly_parent.contains(poly_child) or poly_parent.covers(poly_child):

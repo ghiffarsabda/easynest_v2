@@ -52,7 +52,7 @@ def get_named_parts():
         return _CACHED_NAMED_PARTS
 
     from cdr_enhancer import extract_paths_from_svg, build_isolated_objects
-    part_files = sorted([f for f in os.listdir(PARTS_DIR) if f.endswith(".svg")])
+    part_files = sorted([f for f in os.listdir(PARTS_DIR) if re.match(r"^p\d{2}_[a-z0-9_]+\.svg$", f)])
     named_parts = []
     for pf in part_files:
         full_p = os.path.join(PARTS_DIR, pf)
@@ -85,21 +85,6 @@ def get_catalogue() -> List[Dict[str, Any]]:
         "p12_frame_gusset_tag": ("Frame Gusset Tag", "Tier C (Small Hardware)", "Triangular chassis reinforcement gusset with lightening aperture")
     }
 
-    baseline_max_fit = {
-        "p01_front_fairing": 14,
-        "p02_rear_tail_hugger": 25,
-        "p03_radiator_shroud": 27,
-        "p04_engine_skid_plate": 21,
-        "p05_tail_tidy_bracket": 60,
-        "p06_rearset_footpeg_hanger": 80,
-        "p07_exhaust_heat_shield": 122,
-        "p08_triple_tree_fork_brace": 94,
-        "p09_radiator_grill_bracket": 168,
-        "p10_brake_caliper_bracket": 135,
-        "p11_handlebar_clamp": 262,
-        "p12_frame_gusset_tag": 1170
-    }
-
     for name, obj in named_parts:
         title, tier, desc = friendly_names.get(name, (name, "General Parts", ""))
         w_mm = round(obj.width / 100.0, 1)
@@ -116,7 +101,7 @@ def get_catalogue() -> List[Dict[str, Any]]:
             "height_mm": h_mm,
             "area_cm2": area_cm2,
             "holes": holes_count,
-            "max_fit": baseline_max_fit.get(name, 10),
+            "max_fit": None,  # Dynamically calculated on-demand by nesting engine
             "svg_url": f"/parts/{name}.svg"
         })
 
@@ -132,34 +117,10 @@ def calculate_max_fit(
     kerf_mm: float = 2.0,
     margin_mm: float = 5.0
 ) -> int:
-    """Calculates or retrieves the maximum number of instances of a part that fit on a sheet."""
+    """Calculates dynamically the true maximum number of instances of a part that fit on a sheet."""
     cache_key = (part_name, round(sheet_w_mm, 1), round(sheet_h_mm, 1), round(kerf_mm, 2), round(margin_mm, 2))
     if cache_key in _MAX_FIT_CACHE:
         return _MAX_FIT_CACHE[cache_key]
-
-    is_standard = (
-        abs(sheet_w_mm - 1220.0) < 1.0 and
-        abs(sheet_h_mm - 2440.0) < 1.0 and
-        abs(kerf_mm - 2.0) < 0.1 and
-        abs(margin_mm - 5.0) < 0.1
-    )
-    baseline = {
-        "p01_front_fairing": 14,
-        "p02_rear_tail_hugger": 25,
-        "p03_radiator_shroud": 27,
-        "p04_engine_skid_plate": 21,
-        "p05_tail_tidy_bracket": 60,
-        "p06_rearset_footpeg_hanger": 80,
-        "p07_exhaust_heat_shield": 122,
-        "p08_triple_tree_fork_brace": 94,
-        "p09_radiator_grill_bracket": 168,
-        "p10_brake_caliper_bracket": 135,
-        "p11_handlebar_clamp": 262,
-        "p12_frame_gusset_tag": 1170
-    }
-    if is_standard and part_name in baseline:
-        _MAX_FIT_CACHE[cache_key] = baseline[part_name]
-        return baseline[part_name]
 
     try:
         from industrial_nest import IndustrialNestingEngine
@@ -173,16 +134,24 @@ def calculate_max_fit(
             kerf_mm=kerf_mm,
             margin_mm=margin_mm
         )
-        res = engine.optimize_multi_part_nesting([(part_name, part_obj)])
-        count = max(1, res.total_parts_count)
+        protos = engine.prepare_part_prototypes(part_obj)
+        cluster_placed = engine.solve_cluster_tessellation(protos)
+        count = max(1, len(cluster_placed))
         _MAX_FIT_CACHE[cache_key] = count
         return count
-    except Exception:
-        base_count = baseline.get(part_name, 10)
-        area_factor = (sheet_w_mm * sheet_h_mm) / (1220.0 * 2440.0)
-        est = max(1, int(base_count * area_factor))
-        _MAX_FIT_CACHE[cache_key] = est
-        return est
+    except Exception as e:
+        print(f"[!] Dynamic Max Fit calculation error for {part_name}: {e}")
+        named_parts = dict(get_named_parts())
+        if part_name in named_parts:
+            part_obj = named_parts[part_name]
+            w_mm = (part_obj.width / 100.0) + kerf_mm
+            h_mm = (part_obj.height / 100.0) + kerf_mm
+            u_w = max(10.0, sheet_w_mm - 2 * margin_mm)
+            u_h = max(10.0, sheet_h_mm - 2 * margin_mm)
+            est = max(1, int((u_w / w_mm) * (u_h / h_mm)))
+            _MAX_FIT_CACHE[cache_key] = est
+            return est
+        return 1
 
 
 def parse_sheet_metadata(svg_path: str) -> Dict[str, Any]:
@@ -265,6 +234,15 @@ def parse_sheet_metadata(svg_path: str) -> Dict[str, Any]:
 
     is_partial = (remnant_dims is not None) or ("PARTIAL" in content)
 
+    # Check for Jev Review Data
+    jev_review = None
+    jev_match = re.search(r'<!-- JEV_REVIEW_DATA: (.*?) -->', content)
+    if jev_match:
+        try:
+            jev_review = json.loads(jev_match.group(1))
+        except Exception:
+            pass
+
     return {
         "filename": filename,
         "batch_id": batch_id,
@@ -278,6 +256,7 @@ def parse_sheet_metadata(svg_path: str) -> Dict[str, Any]:
         "is_partial": is_partial,
         "is_fill": is_fill,
         "fill_info": fill_info,
+        "jev_review": jev_review,
         "cut_axis": cut_axis,
         "cut_pos_mm": cut_pos_mm,
         "cut_x_mm": cut_x_mm,
@@ -328,6 +307,9 @@ def get_all_batches_grouped() -> List[Dict[str, Any]]:
     return sorted_batches
 
 
+_BATCH_LOCK = threading.Lock()
+
+
 def execute_production_batch(
     batch_name: str,
     order: Dict[str, int],
@@ -338,57 +320,83 @@ def execute_production_batch(
     packing_strategy: str = "auto"
 ) -> Dict[str, Any]:
     """Executes MultiSheetBatchPlanner for a user-configured production batch."""
-    from batch_nest import MultiSheetBatchPlanner
-    from cdr_enhancer import render_preview_png
+    if not _BATCH_LOCK.acquire(blocking=False):
+        raise RuntimeError("Another batch is currently processing on the server. Please wait for it to complete.")
+    try:
+        from batch_nest import MultiSheetBatchPlanner
+        from cdr_enhancer import render_preview_png
 
-    named_parts = get_named_parts()
-    valid_part_names = {name for name, _ in named_parts}
-    # Filter order to only valid catalogue parts with qty > 0
-    clean_order = {k: int(v) for k, v in order.items() if k in valid_part_names and int(v) > 0}
-    if not clean_order:
-        raise ValueError(f"Order must contain at least one valid part with quantity > 0. Valid parts: {sorted(list(valid_part_names))}")
+        named_parts = get_named_parts()
+        valid_part_names = {name for name, _ in named_parts}
+        # Filter order to only valid catalogue parts with qty > 0 or max_fit
+        clean_order = {}
+        for k, v in order.items():
+            if k in valid_part_names:
+                v_str = str(v).strip().lower()
+                if v_str in ("max_fit", "???", "max", "-1"):
+                    clean_order[k] = "max_fit"
+                elif v_str.isdigit() and int(v_str) > 0:
+                    clean_order[k] = int(v_str)
 
-    # Sanitize batch slug
-    safe_slug = re.sub(r'[^a-zA-Z0-9_-]', '_', batch_name.strip())
-    if not safe_slug:
-        safe_slug = f"batch_{int(time.time())}"
+        if not clean_order:
+            raise ValueError(f"Order must contain at least one valid part with quantity > 0 or Max Fit ('???'). Valid parts: {sorted(list(valid_part_names))}")
 
-    planner = MultiSheetBatchPlanner(
-        sheet_w_mm=sheet_w_mm,
-        sheet_h_mm=sheet_h_mm,
-        kerf_mm=kerf_mm,
-        margin_mm=margin_mm,
-        packing_strategy=packing_strategy
-    )
+        # Sanitize batch slug
+        safe_slug = re.sub(r'[^a-zA-Z0-9_-]', '_', batch_name.strip())
+        if not safe_slug:
+            safe_slug = f"batch_{int(time.time())}"
 
-    t0 = time.time()
-    records = planner.run_batch_order(clean_order, named_parts, output_prefix=safe_slug)
-    runtime_s = round(time.time() - t0, 2)
+        planner = MultiSheetBatchPlanner(
+            sheet_w_mm=sheet_w_mm,
+            sheet_h_mm=sheet_h_mm,
+            kerf_mm=kerf_mm,
+            margin_mm=margin_mm,
+            packing_strategy=packing_strategy
+        )
 
-    # Generate preview PNG for partial sheet or first sheet if possible
-    if records and records[-1].output_svg_path and os.path.exists(records[-1].output_svg_path):
-        png_out = records[-1].output_svg_path.replace(".svg", "_preview.png")
-        def _render_bg(svg_p, png_p):
-            try:
-                render_preview_png(svg_p, png_p, dpi=90)
-            except Exception:
-                pass
-        threading.Thread(target=_render_bg, args=(records[-1].output_svg_path, png_out), daemon=True).start()
+        t0 = time.time()
+        records = planner.run_batch_order(clean_order, named_parts, output_prefix=safe_slug)
+        runtime_s = round(time.time() - t0, 2)
 
-    # Build response summary
-    total_parts = sum(r.total_parts for r in records)
-    total_salvage_m2 = sum((r.remnant_area_m2 or 0.0) for r in records)
+        # Generate preview PNG for partial sheet or first sheet if possible
+        if records and records[-1].output_svg_path and os.path.exists(records[-1].output_svg_path):
+            png_out = records[-1].output_svg_path.replace(".svg", "_preview.png")
+            def _render_bg(svg_p, png_p):
+                try:
+                    render_preview_png(svg_p, png_p, dpi=90)
+                except Exception:
+                    pass
+            threading.Thread(target=_render_bg, args=(records[-1].output_svg_path, png_out), daemon=True).start()
 
-    return {
-        "success": True,
-        "batch_id": safe_slug,
-        "batch_title": safe_slug.replace("_", " ").title(),
-        "total_parts_ordered": sum(clean_order.values()),
-        "total_parts_produced": total_parts,
-        "sheets_count": len(records),
-        "salvaged_remnant_m2": round(total_salvage_m2, 3),
-        "runtime_seconds": runtime_s
-    }
+        # Build response summary
+        total_parts = sum(r.total_parts for r in records)
+        total_salvage_m2 = sum((r.remnant_area_m2 or 0.0) for r in records)
+        total_ordered_display = "???" if any(v == "max_fit" for v in clean_order.values()) else sum(clean_order.values())
+
+        # Collect Jev review summaries across sheets
+        jev_reviews_summary = [
+            {
+                "sheet_index": r.sheet_index,
+                "verdict": getattr(r, 'jev_final_verdict', 'Approved'),
+                "iterations_count": len(getattr(r, 'jev_review_history', [])),
+                "history": getattr(r, 'jev_review_history', [])
+            }
+            for r in records if getattr(r, 'jev_review_history', None)
+        ]
+
+        return {
+            "success": True,
+            "batch_id": safe_slug,
+            "batch_title": safe_slug.replace("_", " ").title(),
+            "total_parts_ordered": total_ordered_display,
+            "total_parts_produced": total_parts,
+            "sheets_count": len(records),
+            "salvaged_remnant_m2": round(total_salvage_m2, 3),
+            "runtime_seconds": runtime_s,
+            "jev_reviews": jev_reviews_summary
+        }
+    finally:
+        _BATCH_LOCK.release()
 
 
 def execute_fill_batch(
@@ -418,46 +426,50 @@ def execute_fill_batch(
     if not safe_slug:
         safe_slug = f"fill_{primary_part_name}_{filler_part_name}_{int(time.time())}"
 
-    planner = MultiSheetBatchPlanner(
-        sheet_w_mm=sheet_w_mm,
-        sheet_h_mm=sheet_h_mm,
-        kerf_mm=kerf_mm,
-        margin_mm=margin_mm,
-        packing_strategy=packing_strategy
-    )
+    _BATCH_LOCK.acquire()
+    try:
+        planner = MultiSheetBatchPlanner(
+            sheet_w_mm=sheet_w_mm,
+            sheet_h_mm=sheet_h_mm,
+            kerf_mm=kerf_mm,
+            margin_mm=margin_mm,
+            packing_strategy=packing_strategy
+        )
 
-    t0 = time.time()
-    record = planner.run_fill_order(
-        primary_part_name=primary_part_name,
-        filler_part_name=filler_part_name,
-        named_parts=named_parts,
-        primary_qty_mode=primary_mode,
-        primary_qty=(primary_qty or 10),
-        output_prefix=safe_slug
-    )
-    runtime_s = round(time.time() - t0, 2)
+        t0 = time.time()
+        record = planner.run_fill_order(
+            primary_part_name=primary_part_name,
+            filler_part_name=filler_part_name,
+            named_parts=named_parts,
+            primary_qty_mode=primary_mode,
+            primary_qty=(primary_qty or 10),
+            output_prefix=safe_slug
+        )
+        runtime_s = round(time.time() - t0, 2)
 
-    if record and record.output_svg_path and os.path.exists(record.output_svg_path):
-        png_out = record.output_svg_path.replace(".svg", "_preview.png")
-        def _render_fill_bg(svg_p, png_p):
-            try:
-                render_preview_png(svg_p, png_p, dpi=90)
-            except Exception:
-                pass
-        threading.Thread(target=_render_fill_bg, args=(record.output_svg_path, png_out), daemon=True).start()
+        if record and record.output_svg_path and os.path.exists(record.output_svg_path):
+            png_out = record.output_svg_path.replace(".svg", "_preview.png")
+            def _render_fill_bg(svg_p, png_p):
+                try:
+                    render_preview_png(svg_p, png_p, dpi=90)
+                except Exception:
+                    pass
+            threading.Thread(target=_render_fill_bg, args=(record.output_svg_path, png_out), daemon=True).start()
 
-    return {
-        "success": True,
-        "batch_id": safe_slug,
-        "batch_title": f"⚡ Fill: {primary_part_name} + {filler_part_name}",
-        "total_parts": record.total_parts,
-        "parts_breakdown": record.part_counts,
-        "yield_pct": record.utilization_pct,
-        "scrap_pct": record.scrap_pct,
-        "sheet_svg_path": record.output_svg_path,
-        "svg_filename": os.path.basename(record.output_svg_path) if record.output_svg_path else None,
-        "runtime_seconds": runtime_s
-    }
+        return {
+            "success": True,
+            "batch_id": safe_slug,
+            "batch_title": f"⚡ Fill: {primary_part_name} + {filler_part_name}",
+            "total_parts": record.total_parts,
+            "parts_breakdown": record.part_counts,
+            "yield_pct": record.utilization_pct,
+            "scrap_pct": record.scrap_pct,
+            "sheet_svg_path": record.output_svg_path,
+            "svg_filename": os.path.basename(record.output_svg_path) if record.output_svg_path else None,
+            "runtime_seconds": runtime_s
+        }
+    finally:
+        _BATCH_LOCK.release()
 
 
 # ==============================================================================
@@ -917,6 +929,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
       background: #0f1c33;
       box-shadow: 0 0 0 1px #0284c7;
     }
+    .catalogue-card.is-max-fit {
+      border-color: #38bdf8;
+      background: linear-gradient(135deg, #091a30, #0c2340);
+      box-shadow: 0 0 16px rgba(56, 189, 248, 0.35);
+    }
+    .catalogue-card.is-max-fit .step-input {
+      color: #38bdf8;
+      font-weight: 800;
+      letter-spacing: 0.1em;
+    }
     .card-preview-box {
       height: 140px;
       background: #ffffff;
@@ -1100,6 +1122,19 @@ HTML_PAGE = r"""<!DOCTYPE html>
       font-size: 0.75rem;
       font-weight: 700;
       padding: 0.25rem 0.6rem;
+      border-radius: 6px;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      white-space: nowrap;
+    }
+    .badge-jev-review {
+      background: rgba(139, 92, 246, 0.18);
+      color: #c4b5fd;
+      border: 1px solid rgba(139, 92, 246, 0.45);
+      font-size: 0.75rem;
+      font-weight: 700;
+      padding: 0.25rem 0.65rem;
       border-radius: 6px;
       display: inline-flex;
       align-items: center;
@@ -1569,6 +1604,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <button class="btn btn-sm" onclick="nextSheet()" title="Next Sheet (→)">Next ▶</button>
         <div id="top-remnant-pill" class="badge-remnant" style="display: none;"></div>
         <div id="top-fill-pill" class="badge-fill-stats" style="display: none;"></div>
+        <div id="top-jev-pill" class="badge-jev-review" style="display: none;"></div>
       </div>
 
       <div class="viewer-nav-right">
@@ -1691,13 +1727,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
           <div class="stepper-row">
             <div class="stepper-controls">
               <button class="step-btn" onclick="modifyQty('${item.id}', -1)">−</button>
-              <input id="input-qty-${item.id}" class="step-input" type="number" min="0" max="5000" value="${qty}" onchange="setQty('${item.id}', this.value)" />
+              <input id="input-qty-${item.id}" class="step-input" type="text" value="${qty === '???' || qty === 'max_fit' ? '???' : (qty || 0)}" onchange="setQty('${item.id}', this.value)" />
               <button class="step-btn" onclick="modifyQty('${item.id}', 1)">＋</button>
             </div>
             <div class="quick-adds">
               <button class="quick-btn" onclick="modifyQty('${item.id}', 5)">+5</button>
               <button class="quick-btn" onclick="modifyQty('${item.id}', 10)">+10</button>
-              <button class="quick-btn quick-btn-max" onclick="setMaxFit('${item.id}')" title="Max Fit: Fill sheet with ${item.max_fit || ''} units">Max</button>
+              <button class="quick-btn quick-btn-max" id="btn-max-${item.id}" onclick="setMaxFit('${item.id}')" title="Max Fit: Pack single sheet to physical saturation (??? parts)">Max (???)</button>
             </div>
           </div>
         `;
@@ -1708,62 +1744,55 @@ HTML_PAGE = r"""<!DOCTYPE html>
     }
 
     function modifyQty(partId, delta) {
-      const cur = orderQuantities[partId] || 0;
-      const next = Math.max(0, cur + delta);
+      const cur = orderQuantities[partId];
+      if (cur === '???' || cur === 'max_fit') {
+        setQty(partId, delta > 0 ? delta : 0);
+        return;
+      }
+      const curNum = typeof cur === 'number' ? cur : (parseInt(cur) || 0);
+      const next = Math.max(0, curNum + delta);
       setQty(partId, next);
     }
 
-    async function setMaxFit(partId) {
-      const sheetW = parseFloat(document.getElementById('input-sheet-w') ? document.getElementById('input-sheet-w').value : 1220) || 1220.0;
-      const sheetH = parseFloat(document.getElementById('input-sheet-h') ? document.getElementById('input-sheet-h').value : 2440) || 2440.0;
-      const kerf = parseFloat(document.getElementById('input-kerf') ? document.getElementById('input-kerf').value : 2.0) || 2.0;
-      const margin = parseFloat(document.getElementById('input-margin') ? document.getElementById('input-margin').value : 5.0) || 5.0;
-
-      const item = catalogueData.find(c => c.id === partId);
-      // Fast path: if standard sheet dimensions (1220x2440, kerf 2, margin 5) and item has precomputed max_fit
-      if (item && item.max_fit && Math.abs(sheetW - 1220) < 1 && Math.abs(sheetH - 2440) < 1 && Math.abs(kerf - 2) < 0.1 && Math.abs(margin - 5) < 0.1) {
-        setQty(partId, item.max_fit);
-        return;
-      }
-
-      // If custom sheet or params, fetch from API
-      try {
-        const res = await fetch(`/api/max_fit?part=${partId}&w=${sheetW}&h=${sheetH}&kerf=${kerf}&margin=${margin}`);
-        const data = await res.json();
-        if (data && data.max_fit) {
-          setQty(partId, data.max_fit);
-          return;
-        }
-      } catch (e) {
-        console.warn('Could not fetch dynamic max fit:', e);
-      }
-
-      // Fallback
-      if (item && item.max_fit) {
-        const areaRatio = (sheetW * sheetH) / (1220.0 * 2440.0);
-        setQty(partId, Math.max(1, Math.floor(item.max_fit * areaRatio)));
-      }
+    function setMaxFit(partId) {
+      setQty(partId, '???');
     }
 
     function setQty(partId, val) {
-      const num = Math.max(0, parseInt(val) || 0);
-      orderQuantities[partId] = num;
+      let isMax = false;
+      let num = 0;
+      const vStr = String(val).trim().toLowerCase();
+      if (vStr === '???' || vStr === 'max' || vStr === 'max_fit') {
+        isMax = true;
+        orderQuantities[partId] = '???';
+      } else {
+        num = Math.max(0, parseInt(val) || 0);
+        orderQuantities[partId] = num;
+      }
+
       const inp = document.getElementById(`input-qty-${partId}`);
-      if (inp) inp.value = num;
+      if (inp) inp.value = isMax ? '???' : num;
 
       const card = document.getElementById(`card-${partId}`);
-      if (card) card.classList.toggle('has-qty', num > 0);
+      if (card) {
+        card.classList.toggle('has-qty', isMax || num > 0);
+        card.classList.toggle('is-max-fit', isMax);
+      }
 
       updateOrderSummary();
     }
 
     function updateOrderSummary() {
       let totalParts = 0;
+      let hasMaxFit = false;
       let uniqueCount = 0;
       let totalAreaCm2 = 0;
 
       for (const [id, qty] of Object.entries(orderQuantities)) {
-        if (qty > 0) {
+        if (qty === '???' || qty === 'max_fit') {
+          hasMaxFit = true;
+          uniqueCount += 1;
+        } else if (typeof qty === 'number' && qty > 0) {
           totalParts += qty;
           uniqueCount += 1;
           const item = catalogueData.find(c => c.id === id);
@@ -1771,13 +1800,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
         }
       }
 
-      document.getElementById('banner-parts-count').textContent = totalParts;
+      const countText = hasMaxFit ? (totalParts > 0 ? `${totalParts} + ???` : '???') : totalParts;
+      document.getElementById('banner-parts-count').textContent = countText;
       document.getElementById('banner-unique-parts').textContent = uniqueCount;
-      document.getElementById('banner-est-area').textContent = `${(totalAreaCm2 / 10000).toFixed(2)} m²`;
+      document.getElementById('banner-est-area').textContent = hasMaxFit ? 'Max Sheet Fit (???)' : `${(totalAreaCm2 / 10000).toFixed(2)} m²`;
 
       const btn = document.getElementById('btn-process-batch');
-      btn.disabled = (totalParts === 0);
-      btn.innerHTML = `<span>🚀</span> PROCESS BATCH (${totalParts} Parts)`;
+      const canProcess = hasMaxFit || totalParts > 0;
+      btn.disabled = !canProcess;
+      btn.innerHTML = `<span>🚀</span> PROCESS BATCH (${countText} Parts)`;
     }
 
     function applyPreset(type) {
@@ -2084,6 +2115,20 @@ HTML_PAGE = r"""<!DOCTYPE html>
         remnantPill.style.display = 'none';
       }
 
+      const jevPill = document.getElementById('top-jev-pill');
+      if (jevPill) {
+        if (sheet.jev_review && sheet.jev_review.history && sheet.jev_review.history.length > 0) {
+          const hist = sheet.jev_review.history;
+          const lastStep = hist[hist.length - 1];
+          const passes = hist.length;
+          jevPill.style.display = 'inline-flex';
+          jevPill.innerHTML = `🧠 Jev Review: ${sheet.jev_review.verdict} (${passes} Semifinal ${passes === 1 ? 'Pass' : 'Passes'}) • Compactness: ${lastStep.compactness_score}/5`;
+          jevPill.title = hist.map(h => `${h.semifinal_version}: Compactness ${h.compactness_score}/5 | Jev Action: ${h.action_choice} | Decision: ${h.decision}\n${h.outlier_desc}${h.transformation_applied ? '\nApplied: ' + h.transformation_applied : ''}`).join('\n\n');
+        } else {
+          jevPill.style.display = 'none';
+        }
+      }
+
       // Manifest Pills
       const pillsContainer = document.getElementById('part-pills');
       pillsContainer.innerHTML = '';
@@ -2253,7 +2298,14 @@ class VisualizerRequestHandler(SimpleHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
-            self.wfile.write(json.dumps({"part_id": part_id, "max_fit": max_fit_count}).encode("utf-8"))
+            self.wfile.write(json.dumps({
+                "part_id": part_id,
+                "max_fit": max_fit_count,
+                "sheet_w_mm": sheet_w,
+                "sheet_h_mm": sheet_h,
+                "kerf_mm": kerf,
+                "margin_mm": margin
+            }).encode("utf-8"))
             return
 
         elif path.startswith("/parts/"):

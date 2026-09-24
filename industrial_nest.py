@@ -319,7 +319,12 @@ class IndustrialNestingEngine:
                             p_b = affinity.translate(p_buf, x, y)
 
                             tree = STRtree(placed_bufs) if placed_bufs else None
-                            if tree is None or len(tree.query(p_b, predicate='intersects')) == 0:
+                            has_collision = False
+                            if tree is not None:
+                                hits = tree.query(p_b, predicate='intersects')
+                                if any(p_b.intersection(placed_bufs[h]).area > 1.0 for h in hits):
+                                    has_collision = True
+                            if not has_collision:
                                 col_instances.append(PlacedInstance(
                                     part_index=part_idx, angle=angle, x=x, y=y,
                                     polygon=p_inst, buffered_polygon=p_b
@@ -330,9 +335,9 @@ class IndustrialNestingEngine:
                                 placed_here.append(inst)
                                 placed_bufs.append(inst.buffered_polygon)
                             max_r = max(inst.polygon.bounds[2] for inst in col_instances)
-                            col_base_x = max_r + self.kerf
+                            col_base_x = max(col_base_x + 1.0, max_r + self.kerf)
                         else:
-                            col_base_x += col_w
+                            col_base_x += max(col_w, 1.0)
 
                 else:  # 'straight_row'
                     dx_step = col_w
@@ -354,7 +359,12 @@ class IndustrialNestingEngine:
                             p_b = affinity.translate(p_buf, x, y)
 
                             tree = STRtree(placed_bufs) if placed_bufs else None
-                            if tree is None or len(tree.query(p_b, predicate='intersects')) == 0:
+                            has_collision = False
+                            if tree is not None:
+                                hits = tree.query(p_b, predicate='intersects')
+                                if any(p_b.intersection(placed_bufs[h]).area > 1.0 for h in hits):
+                                    has_collision = True
+                            if not has_collision:
                                 row_instances.append(PlacedInstance(
                                     part_index=part_idx, angle=angle, x=x, y=y,
                                     polygon=p_inst, buffered_polygon=p_b
@@ -365,9 +375,9 @@ class IndustrialNestingEngine:
                                 placed_here.append(inst)
                                 placed_bufs.append(inst.buffered_polygon)
                             max_top = max(inst.polygon.bounds[3] for inst in row_instances)
-                            row_base_y = max_top + self.kerf
+                            row_base_y = max(row_base_y + 1.0, max_top + self.kerf)
                         else:
-                            row_base_y += (ph + self.kerf)
+                            row_base_y += max(ph + self.kerf, 1.0)
 
                 # Secondary Void Filler in unused strips only
                 placed_here = self._fill_boundary_strips(placed_here, prototypes, part_idx=part_idx)
@@ -408,10 +418,13 @@ class IndustrialNestingEngine:
 
             if right_strip_w >= pw:
                 x_start = max_placed_x + self.kerf
-                for y in np.arange(self.usable_min_y, self.usable_max_y - ph + 1, max(ph * 0.5, 500.0)):
-                    for x in np.arange(x_start, self.usable_max_x - pw + 1, max(pw * 0.5, 500.0)):
+                step_y = max(ph + self.kerf, 100.0)
+                step_x = max(pw + self.kerf, 100.0)
+                for y in np.arange(self.usable_min_y, self.usable_max_y - ph + 1, step_y):
+                    for x in np.arange(x_start, self.usable_max_x - pw + 1, step_x):
                         cand_buf = affinity.translate(p_buf, x, y)
-                        if len(tree.query(cand_buf, predicate='intersects')) == 0:
+                        hits = tree.query(cand_buf, predicate='intersects')
+                        if not any(cand_buf.intersection(placed_bufs[h]).area > 1.0 for h in hits):
                             cand_real = affinity.translate(p, x, y)
                             inst = PlacedInstance(
                                 part_index=part_idx, angle=angle, x=x, y=y,
@@ -423,10 +436,13 @@ class IndustrialNestingEngine:
 
             if top_strip_h >= ph:
                 y_start = max_placed_y + self.kerf
-                for y in np.arange(y_start, self.usable_max_y - ph + 1, max(ph * 0.5, 500.0)):
-                    for x in np.arange(self.usable_min_x, self.usable_max_x - pw + 1, max(pw * 0.5, 500.0)):
+                step_y = max(ph + self.kerf, 100.0)
+                step_x = max(pw + self.kerf, 100.0)
+                for y in np.arange(y_start, self.usable_max_y - ph + 1, step_y):
+                    for x in np.arange(self.usable_min_x, self.usable_max_x - pw + 1, step_x):
                         cand_buf = affinity.translate(p_buf, x, y)
-                        if len(tree.query(cand_buf, predicate='intersects')) == 0:
+                        hits = tree.query(cand_buf, predicate='intersects')
+                        if not any(cand_buf.intersection(placed_bufs[h]).area > 1.0 for h in hits):
                             cand_real = affinity.translate(p, x, y)
                             inst = PlacedInstance(
                                 part_index=part_idx, angle=angle, x=x, y=y,
@@ -494,7 +510,8 @@ class IndustrialNestingEngine:
                             )
                             break
 
-                        overlaps = tree.query(cand_buf, predicate='intersects')
+                        raw_hits = tree.query(cand_buf, predicate='intersects')
+                        overlaps = [h for h in raw_hits if cand_buf.intersection(placed_bufs[h]).area > 1.0]
                         if len(overlaps) == 0:
                             if score < best_score:
                                 best_score = score
@@ -885,8 +902,8 @@ def _superposition_universe_worker(task: Dict[str, Any]) -> Dict[str, Any]:
                     while y <= (y_max - gh):
                         x = x_min
                         while x <= (x_max - gw):
-                            cand_b = affinity.translate(pb, x, y)
-                            hits = tree.query(cand_b, predicate='intersects') if tree is not None else []
+                            raw_hits = tree.query(cand_b, predicate='intersects') if tree is not None else []
+                            hits = [h for h in raw_hits if cand_b.intersection(placed_bufs[h]).area > 1.0]
                             if len(hits) == 0:
                                 cand_real = affinity.translate(pr_poly, x, y)
                                 inst = PlacedInstance(filler_orig_idx, a, x, y, cand_real, cand_b)
@@ -1225,8 +1242,9 @@ def run_cli():
         prefix = "_".join(n.replace(" ", "_") for n, _ in named_parts[:2])
         if len(named_parts) > 2:
             prefix += f"_plus_{len(named_parts)-2}"
+        out_dir = "output" if os.path.isdir("output") else "."
         output_svg = os.path.join(
-            os.path.dirname(os.path.abspath(args.inputs[0])),
+            out_dir,
             f"{prefix}_mixed_nested_{int(sheet_w_mm)}x{int(sheet_h_mm)}.svg"
         )
 
