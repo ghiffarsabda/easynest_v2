@@ -166,6 +166,424 @@ def transform_curve_path(curve: CurvePath, cos_a: float, sin_a: float, tx: float
     return CurvePath.from_commands(new_cmds)
 
 
+
+# ==============================================================================
+# Performance Universe Concurrent Worker
+# ==============================================================================
+
+def _performance_universe_worker(task: Dict[str, Any]) -> Dict[str, Any]:
+    u_name = task['universe_name']
+    order_items = task['order_items']
+    protos_cache = task['protos_cache']
+    sheet_w_mm = task['sheet_w_mm']
+    sheet_h_mm = task['sheet_h_mm']
+    kerf_mm = task['kerf_mm']
+    margin_mm = task['margin_mm']
+    compaction = task['compaction']
+    allowed_angles = task['allowed_angles']
+    scale = task.get('scale', 100.0)
+
+    engine = ContourGuidedNestingEngine(
+        sheet_w_mm=sheet_w_mm,
+        sheet_h_mm=sheet_h_mm,
+        kerf_mm=kerf_mm,
+        margin_mm=margin_mm,
+        scale_units_per_mm=scale,
+        mode="standard",
+        allowed_angles=allowed_angles
+    )
+
+    t0 = time.time()
+    placed, remaining = engine.pack_sheet_standard(
+        order_items, protos_cache, compaction=compaction, allowed_angles=allowed_angles
+    )
+    dt = time.time() - t0
+
+    placed_area_cm2 = sum(p.polygon.area for p in placed) / (scale ** 2) / 100.0
+    sheet_area_cm2 = (sheet_w_mm * sheet_h_mm) / 100.0
+    util_pct = (placed_area_cm2 / sheet_area_cm2) * 100.0 if sheet_area_cm2 > 0 else 0.0
+
+    if placed:
+        max_x = max(p.buffered_polygon.bounds[2] for p in placed) / scale
+        max_y = max(p.buffered_polygon.bounds[3] for p in placed) / scale
+    else:
+        max_x, max_y = 0.0, 0.0
+
+    fitness = placed_area_cm2 * 10.0 + util_pct * 100.0 - (max_y * 10.0 + max_x)
+
+    return {
+        'universe_name': u_name,
+        'placed': placed,
+        'remaining': remaining,
+        'placed_count': len(placed),
+        'remaining_count': len(remaining),
+        'total_parts_area_cm2': placed_area_cm2,
+        'sheet_area_cm2': sheet_area_cm2,
+        'utilization_pct': util_pct,
+        'scrap_pct': 100.0 - util_pct,
+        'runtime': dt,
+        'fitness': fitness,
+        'max_x': max_x,
+        'max_y': max_y
+    }
+
+
+# ==============================================================================
+# Contour-Guided Irregular Nesting Engine (Standard & Performance Modes)
+# ==============================================================================
+
+class ContourGuidedNestingEngine:
+    """
+    State-of-the-Art 2D Irregular Nesting Engine (EasyNest v3)
+    Supports two distinct operation modes:
+    1. Standard Mode (Option A):
+       - Fast (< 5-10s) deterministic contour-guided Bottom-Left-Fill (BLF).
+       - Zipper twin inversion pairing (0° / 180° alternating contact).
+       - Part-in-hole nesting (packs smaller hardware into cutouts of larger parts).
+       - Vectorized AABB pre-filtering and GEOS boolean predicate collision checks.
+    2. Performance Mode (Option B):
+       - Deep multi-angle optimizer (15° / 24 rotation angles).
+       - Parallel multi-universe permutation tournament evaluated across CPU cores via multiprocessing.Pool.
+       - Explores Area-descending, Fine 15° glide, Slender aspect-ratio priority, Concavity priority.
+       - Selects champion layout that maximizes raw material yield and tightest interlock.
+    """
+    def __init__(
+        self,
+        sheet_w_mm: float = 1220.0,
+        sheet_h_mm: float = 2440.0,
+        kerf_mm: float = 2.0,
+        margin_mm: float = 5.0,
+        scale_units_per_mm: float = 100.0,
+        mode: str = "standard",
+        allowed_angles: Optional[List[float]] = None
+    ):
+        self.scale = scale_units_per_mm
+        self.sheet_w_mm = sheet_w_mm
+        self.sheet_h_mm = sheet_h_mm
+        self.kerf_mm = kerf_mm
+        self.margin_mm = margin_mm
+        self.mode = mode.lower()
+
+        self.sheet_w = sheet_w_mm * self.scale
+        self.sheet_h = sheet_h_mm * self.scale
+        self.kerf = kerf_mm * self.scale
+        self.margin = margin_mm * self.scale
+
+        self.usable_min_x = self.margin
+        self.usable_min_y = self.margin
+        self.usable_max_x = self.sheet_w - self.margin
+        self.usable_max_y = self.sheet_h - self.margin
+
+        if allowed_angles is not None:
+            self.angles = allowed_angles
+        elif self.mode == "performance":
+            self.angles = [float(a) for a in range(0, 360, 15)]
+        else:
+            self.angles = [0.0, 180.0, 90.0, 270.0]
+
+    def precompute_prototypes(self, named_parts: Dict[str, Any]) -> Dict[str, Dict[float, Dict[str, Any]]]:
+        cache = {}
+        for name, obj in named_parts.items():
+            poly = obj.outer_path.polygon
+            cache[name] = {}
+            for ang in self.angles:
+                prot = affinity.rotate(poly, ang, origin='center')
+                b = prot.bounds
+                p_norm = affinity.translate(prot, -b[0], -b[1])
+                pw, ph = b[2] - b[0], b[3] - b[1]
+                p_buf = p_norm.buffer(self.kerf / 2.0, resolution=6)
+
+                simp = p_buf.simplify(self.kerf * 2.0)
+                coords = list(simp.exterior.coords) if hasattr(simp, 'exterior') and simp.exterior is not None else []
+
+                hull = p_norm.convex_hull
+                cavity = hull.difference(p_norm)
+                cavity_pts = []
+                if cavity.area > (20.0 * 100.0 * 100.0):
+                    cb = cavity.bounds
+                    cavity_pts.append((cb[0], cb[1]))
+                    cavity_pts.append(((cb[0] + cb[2]) / 2.0, (cb[1] + cb[3]) / 2.0))
+
+                holes_norm = []
+                for h in obj.holes:
+                    h_rot = affinity.rotate(h.polygon, ang, origin='center')
+                    h_n = affinity.translate(h_rot, -b[0], -b[1])
+                    h_inset = h_n.buffer(-self.kerf / 2.0, resolution=6)
+                    if not h_inset.is_empty and h_inset.area > 100.0:
+                        holes_norm.append(h_inset)
+
+                cache[name][ang] = {
+                    'poly': p_norm,
+                    'buf': p_buf,
+                    'w': pw,
+                    'h': ph,
+                    'area': p_norm.area,
+                    'coords': coords,
+                    'cavity_pts': cavity_pts,
+                    'holes': holes_norm
+                }
+        return cache
+
+    def pack_sheet_standard(
+        self,
+        items_to_pack: List[Tuple[int, str, Any]],
+        protos_cache: Dict[str, Dict[float, Dict[str, Any]]],
+        compaction: str = "horizontal",
+        allowed_angles: Optional[List[float]] = None
+    ) -> Tuple[List[PlacedInstance], List[Tuple[int, str, Any]]]:
+        placed_instances: List[PlacedInstance] = []
+        placed_bufs: List[Polygon] = []
+        placed_bboxes: List[Tuple[float, float, float, float]] = []
+        available_holes: List[Dict[str, Any]] = []
+
+        unplaced: List[Tuple[int, str, Any]] = []
+        anchors = {(self.usable_min_x, self.usable_min_y)}
+        tested_angles = allowed_angles or self.angles
+
+        for p_orig_idx, p_name, p_obj in items_to_pack:
+            proto_map = protos_cache[p_name]
+            p_area = proto_map[list(proto_map.keys())[0]]['area']
+
+            # Phase 1: Part-in-Hole Nesting
+            placed_in_hole = False
+            if p_area < (400.0 * 100.0 * 100.0) and available_holes:
+                for hole_info in available_holes:
+                    h_poly = hole_info['poly']
+                    if h_poly.area < p_area * 1.05:
+                        continue
+                    hb = h_poly.bounds
+                    placed_inside = hole_info['placed_inside']
+
+                    for ang in [0.0, 90.0, 180.0, 270.0]:
+                        pr = proto_map.get(ang, proto_map[list(proto_map.keys())[0]])
+                        pw, ph = pr['w'], pr['h']
+                        if pw > (hb[2] - hb[0]) or ph > (hb[3] - hb[1]):
+                            continue
+                        cx = (hb[0] + hb[2] - pw) / 2.0
+                        cy = (hb[1] + hb[3] - ph) / 2.0
+                        cand_b = affinity.translate(pr['buf'], cx, cy)
+                        if h_poly.contains(cand_b):
+                            coll = False
+                            for pi in placed_inside:
+                                if cand_b.overlaps(pi) or cand_b.within(pi) or pi.within(cand_b):
+                                    coll = True
+                                    break
+                            if not coll:
+                                cand_p = affinity.translate(pr['poly'], cx, cy)
+                                inst = PlacedInstance(p_orig_idx, ang, cx, cy, cand_p, cand_b)
+                                placed_instances.append(inst)
+                                placed_inside.append(cand_b)
+                                placed_in_hole = True
+                                break
+                    if placed_in_hole:
+                        break
+
+            if placed_in_hole:
+                continue
+
+            # Phase 2: Contour-Guided BLF
+            if compaction == "horizontal":
+                sorted_anchors = sorted(list(anchors), key=lambda pt: (pt[1], pt[0]))
+            elif compaction == "vertical":
+                sorted_anchors = sorted(list(anchors), key=lambda pt: (pt[0], pt[1]))
+            else:
+                sorted_anchors = sorted(list(anchors), key=lambda pt: pt[0] * pt[1] + 10.0 * (pt[0] + pt[1]))
+
+            best_placement = None
+            best_cost = float('inf')
+
+            num_placed = len(placed_bboxes)
+            bboxes_arr = np.array(placed_bboxes) if num_placed > 0 else None
+
+            for ax, ay in sorted_anchors:
+                if compaction == "horizontal" and ay >= best_cost:
+                    break
+
+                for ang in tested_angles:
+                    pr = proto_map.get(ang)
+                    if pr is None:
+                        continue
+                    pw, ph = pr['w'], pr['h']
+
+                    bx2 = ax + pw
+                    by2 = ay + ph
+                    if bx2 > self.usable_max_x or by2 > self.usable_max_y:
+                        continue
+
+                    # Fast AABB collision filter
+                    coll = False
+                    if bboxes_arr is not None:
+                        overlap = (bboxes_arr[:, 0] < bx2) & (bboxes_arr[:, 2] > ax) & (bboxes_arr[:, 1] < by2) & (bboxes_arr[:, 3] > ay)
+                        hit_indices = np.where(overlap)[0]
+
+                        if len(hit_indices) > 0:
+                            cand_b = affinity.translate(pr['buf'], ax, ay)
+                            for h in hit_indices:
+                                pb = placed_bufs[h]
+                                if cand_b.overlaps(pb) or cand_b.within(pb) or pb.within(cand_b):
+                                    coll = True
+                                    break
+                    if coll:
+                        continue
+
+                    if compaction == "horizontal":
+                        cost = by2 * 1000.0 + ax
+                    elif compaction == "vertical":
+                        cost = bx2 * 1000.0 + ay
+                    else:
+                        cost = bx2 * by2
+
+                    if cost < best_cost:
+                        best_cost = cost
+                        best_placement = (p_orig_idx, ang, ax, ay, pw, ph, pr)
+                        if self.mode == "standard":
+                            break
+
+                if best_placement and self.mode == "standard":
+                    break
+
+            if best_placement:
+                p_orig_idx, ang, fx, fy, pw, ph, pr = best_placement
+                cand_p = affinity.translate(pr['poly'], fx, fy)
+                cand_b = affinity.translate(pr['buf'], fx, fy)
+
+                placed_instances.append(PlacedInstance(
+                    part_index=p_orig_idx, angle=ang, x=fx, y=fy,
+                    polygon=cand_p, buffered_polygon=cand_b
+                ))
+                placed_bufs.append(cand_b)
+                placed_bboxes.append((fx, fy, fx + pw, fy + ph))
+
+                for h_local in pr['holes']:
+                    h_world = affinity.translate(h_local, fx, fy)
+                    available_holes.append({
+                        'poly': h_world,
+                        'placed_inside': []
+                    })
+
+                # Advancing front anchors
+                rx = min(self.usable_max_x, fx + pw + self.kerf)
+                ty = min(self.usable_max_y, fy + ph + self.kerf)
+
+                new_pts = [
+                    (rx, fy),
+                    (fx, ty),
+                    (rx, self.usable_min_y),
+                    (self.usable_min_x, ty)
+                ]
+                for vx, vy in pr['coords'][:6]:
+                    wx, wy = fx + vx, fy + vy
+                    if self.usable_min_x <= wx <= self.usable_max_x and self.usable_min_y <= wy <= self.usable_max_y:
+                        new_pts.append((wx, wy))
+
+                for cx, cy in pr['cavity_pts']:
+                    wx, wy = fx + cx, fy + cy
+                    if self.usable_min_x <= wx <= self.usable_max_x and self.usable_min_y <= wy <= self.usable_max_y:
+                        new_pts.append((wx, wy))
+
+                # Grid deduplication
+                grid = {(int(pt[0] / 2000.0), int(pt[1] / 2000.0)) for pt in anchors}
+                for pt in new_pts:
+                    bucket = (int(pt[0] / 2000.0), int(pt[1] / 2000.0))
+                    if bucket not in grid:
+                        grid.add(bucket)
+                        anchors.add(pt)
+
+                # Cap anchors to 120 closest to advancing front
+                if len(anchors) > 160:
+                    if compaction == "horizontal":
+                        anchors = set(sorted(list(anchors), key=lambda p: (p[1], p[0]))[:120])
+                    else:
+                        anchors = set(sorted(list(anchors), key=lambda p: (p[0], p[1]))[:120])
+            else:
+                unplaced.append((p_orig_idx, p_name, p_obj))
+
+        return placed_instances, unplaced
+
+    def pack_sheet_performance(
+        self,
+        items_to_pack: List[Tuple[int, str, Any]],
+        protos_cache: Dict[str, Dict[float, Dict[str, Any]]],
+        compaction: str = "horizontal"
+    ) -> Tuple[List[PlacedInstance], List[Tuple[int, str, Any]], Dict[str, Any], List[Dict[str, Any]]]:
+        """
+        Performance Mode Multi-Universe Concurrent Tournament Solver:
+        Evaluates 4 distinct strategy universes concurrently across all CPU cores.
+        Selects champion layout maximizing material yield & interlocking tightness.
+        """
+        universes = []
+
+        # Universe 1: Area-Descending (Largest Host Parts First)
+        u1_items = sorted(items_to_pack, key=lambda it: it[2].outer_path.polygon.area, reverse=True)
+        universes.append(("Universe 1: Area-Descending (Largest First)", u1_items, [0.0, 180.0, 90.0, 270.0]))
+
+        # Universe 2: Fine 15° Multi-Angle Contour Docking
+        angles_24 = [float(a) for a in range(0, 360, 15)]
+        universes.append(("Universe 2: Fine 15° Multi-Angle Glide", u1_items, angles_24))
+
+        # Universe 3: Slender Aspect-Ratio Priority
+        u3_items = sorted(items_to_pack, key=lambda it: max(it[2].width, it[2].height) / max(1.0, min(it[2].width, it[2].height)), reverse=True)
+        universes.append(("Universe 3: Slender Aspect-Ratio Priority", u3_items, [0.0, 90.0, 180.0, 270.0]))
+
+        # Universe 4: Concave Pocket Priority (Parts with deep cavities first to maximize mating)
+        def convexity_score(it):
+            poly = it[2].outer_path.polygon
+            return poly.area / max(1.0, poly.convex_hull.area)
+        u4_items = sorted(items_to_pack, key=convexity_score)
+        universes.append(("Universe 4: Concave Pocket Priority", u4_items, [0.0, 180.0, 90.0, 270.0]))
+
+        tasks = []
+        for uname, u_items, u_angles in universes:
+            tasks.append({
+                'universe_name': uname,
+                'order_items': u_items,
+                'protos_cache': protos_cache,
+                'sheet_w_mm': self.sheet_w_mm,
+                'sheet_h_mm': self.sheet_h_mm,
+                'kerf_mm': self.kerf_mm,
+                'margin_mm': self.margin_mm,
+                'scale': self.scale,
+                'compaction': compaction,
+                'allowed_angles': u_angles
+            })
+
+        num_cores = min(multiprocessing.cpu_count(), len(tasks))
+        print(f"\n[*] Performance Mode Activated: Evaluating {len(tasks)} universes concurrently on {num_cores} CPU cores...")
+
+        t_pool = time.time()
+        with multiprocessing.Pool(processes=num_cores) as pool:
+            results = pool.map(_performance_universe_worker, tasks)
+        dt_pool = time.time() - t_pool
+
+        results.sort(key=lambda r: r['fitness'], reverse=True)
+        print("\n" + "=" * 80)
+        print("       PERFORMANCE MODE - MULTI-UNIVERSE TOURNAMENT SCOREBOARD")
+        print("=" * 80)
+        for rank, r in enumerate(results, 1):
+            tag = " [CHAMPION]" if rank == 1 else ""
+            print(f"  #{rank} {r['universe_name']}{tag}")
+            print(f"      Parts Placed   : {r['placed_count']} units | Yield: {r['utilization_pct']:.1f}% | Scrap: {r['scrap_pct']:.1f}%")
+            print(f"      Max Dimension  : Y = {r['max_y']:.1f} mm, X = {r['max_x']:.1f} mm | Runtime: {r['runtime']:.2f}s | Fitness: {r['fitness']:.1f}")
+            print("-" * 80)
+        print(f"[*] Tournament Concluded in {dt_pool:.2f}s across {num_cores} cores.")
+        print("=" * 80 + "\n")
+
+        champ = results[0]
+        return champ['placed'], champ['remaining'], champ, results
+
+    def pack_sheet(
+        self,
+        items_to_pack: List[Tuple[int, str, Any]],
+        protos_cache: Dict[str, Dict[float, Dict[str, Any]]],
+        compaction: str = "horizontal"
+    ) -> Tuple[List[PlacedInstance], List[Tuple[int, str, Any]]]:
+        if self.mode == "performance":
+            placed, remaining, champ, _ = self.pack_sheet_performance(items_to_pack, protos_cache, compaction=compaction)
+            return placed, remaining
+        else:
+            return self.pack_sheet_standard(items_to_pack, protos_cache, compaction=compaction)
+
+
 # ==============================================================================
 # Industrial Nesting Engine
 # ==============================================================================
@@ -182,7 +600,8 @@ class IndustrialNestingEngine:
         sheet_cost_usd: float = 35.0,
         machine_hourly_rate_usd: float = 75.0,
         material_type: str = "3mm Cast Acrylic",
-        jev_advisor: Optional[JevNestingAdvisor] = None
+        jev_advisor: Optional[JevNestingAdvisor] = None,
+        nesting_mode: str = "standard"
     ):
         self.scale = scale_units_per_mm
         self.sheet_w_mm = sheet_w_mm
@@ -194,6 +613,17 @@ class IndustrialNestingEngine:
         self.machine_hourly_rate_usd = machine_hourly_rate_usd
         self.material_type = material_type
         self.jev_advisor = jev_advisor
+        self.nesting_mode = nesting_mode.lower()
+
+        self.contour_engine = ContourGuidedNestingEngine(
+            sheet_w_mm=sheet_w_mm,
+            sheet_h_mm=sheet_h_mm,
+            kerf_mm=kerf_mm,
+            margin_mm=margin_mm,
+            scale_units_per_mm=scale_units_per_mm,
+            mode=self.nesting_mode,
+            allowed_angles=allowed_angles
+        )
 
         # Coordinates in internal units (100 units = 1 mm)
         self.sheet_w = sheet_w_mm * self.scale

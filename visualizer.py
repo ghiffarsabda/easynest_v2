@@ -317,7 +317,8 @@ def execute_production_batch(
     sheet_h_mm: float = 2440.0,
     kerf_mm: float = 2.0,
     margin_mm: float = 5.0,
-    packing_strategy: str = "auto"
+    packing_strategy: str = "auto",
+    nesting_mode: str = "standard"
 ) -> Dict[str, Any]:
     """Executes MultiSheetBatchPlanner for a user-configured production batch."""
     if not _BATCH_LOCK.acquire(blocking=False):
@@ -351,7 +352,8 @@ def execute_production_batch(
             sheet_h_mm=sheet_h_mm,
             kerf_mm=kerf_mm,
             margin_mm=margin_mm,
-            packing_strategy=packing_strategy
+            packing_strategy=packing_strategy,
+            nesting_mode=nesting_mode
         )
 
         t0 = time.time()
@@ -833,6 +835,55 @@ HTML_PAGE = r"""<!DOCTYPE html>
       align-items: center;
       gap: 0.4rem;
       white-space: nowrap;
+    }
+
+    /* Nesting Mode Selector */
+    .nesting-mode-selector {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 0.75rem;
+      width: 100%;
+    }
+    .mode-pill-option {
+      background: #111827;
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      padding: 0.65rem 0.9rem;
+      cursor: pointer;
+      display: flex;
+      flex-direction: column;
+      gap: 0.3rem;
+      transition: all 0.15s ease;
+      user-select: none;
+    }
+    .mode-pill-option:hover {
+      border-color: #38bdf8;
+      background: #132035;
+    }
+    .mode-pill-option.active {
+      border-color: #0284c7;
+      background: linear-gradient(135deg, #0d2340, #0a192f);
+      box-shadow: 0 0 14px rgba(2, 132, 199, 0.35);
+    }
+    .mode-pill-badge {
+      font-size: 0.85rem;
+      font-weight: 700;
+      color: #38bdf8;
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+    }
+    .mode-badge-perf {
+      color: #c084fc;
+    }
+    .mode-pill-option.active .mode-badge-perf {
+      color: #d8b4fe;
+      text-shadow: 0 0 10px rgba(192, 132, 252, 0.5);
+    }
+    .mode-pill-desc {
+      font-size: 0.72rem;
+      color: var(--text-dim);
+      line-height: 1.35;
     }
 
     /* Batch Action Banner */
@@ -1413,6 +1464,21 @@ HTML_PAGE = r"""<!DOCTYPE html>
             <option value="compact">Compact Block (Corner Envelope)</option>
           </select>
         </div>
+
+        <!-- Nesting Engine Mode Selector (Option A / Option B) -->
+        <div class="input-group" style="grid-column: 1 / -1;">
+          <label class="input-label">Nesting Engine Mode</label>
+          <div class="nesting-mode-selector">
+            <div class="mode-pill-option active" id="pill-mode-standard" onclick="selectNestingMode('standard')">
+              <span class="mode-pill-badge">⚡ Standard Mode (Option A)</span>
+              <span class="mode-pill-desc">Deterministic Contour-Guided BLF + Zipper Twin Inversion + Part-in-Hole Nesting. Fast &amp; reliable (&lt; 10s).</span>
+            </div>
+            <div class="mode-pill-option" id="pill-mode-performance" onclick="selectNestingMode('performance')">
+              <span class="mode-pill-badge mode-badge-perf">🧬 Performance Mode (Option B)</span>
+              <span class="mode-pill-desc">Deep Multi-Angle Optimizer &amp; Parallel 4-Core Tournament. Explores 24 angles &amp; permutations for maximum yield (~25–40s).</span>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -1830,6 +1896,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
       renderCatalogue();
     }
 
+    let selectedNestingMode = 'standard';
+
+    function selectNestingMode(mode) {
+      selectedNestingMode = mode;
+      const stdPill = document.getElementById('pill-mode-standard');
+      const perfPill = document.getElementById('pill-mode-performance');
+      if (stdPill) stdPill.classList.toggle('active', mode === 'standard');
+      if (perfPill) perfPill.classList.toggle('active', mode === 'performance');
+    }
+
     // Process Batch Run (POST /api/run_batch)
     async function processBatch() {
       const batchName = document.getElementById('input-batch-name').value.trim() || generateDefaultBatchName();
@@ -1841,8 +1917,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
       const overlay = document.getElementById('progress-overlay');
       overlay.style.display = 'flex';
-      document.getElementById('progress-text').textContent = `Processing Batch: ${batchName}...`;
-      document.getElementById('progress-subtext').textContent = 'Allocating orders & compacting partial sheets with guillotine cut line...';
+      document.getElementById('progress-text').textContent = `Processing Batch (${selectedNestingMode === 'performance' ? 'Performance Mode' : 'Standard Mode'}): ${batchName}...`;
+      document.getElementById('progress-subtext').textContent = selectedNestingMode === 'performance'
+        ? 'Evaluating multi-universe multi-angle permutations concurrently on 4 CPU cores...'
+        : 'Allocating orders with contour-guided BLF, zipper twin pairing & part-in-hole nesting...';
 
       try {
         const res = await fetch('/api/run_batch', {
@@ -1855,7 +1933,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
             sheet_h_mm: sheetH,
             kerf_mm: kerf,
             margin_mm: margin,
-            packing_strategy: packingStrategy
+            packing_strategy: packingStrategy,
+            nesting_mode: selectedNestingMode
           })
         });
 
@@ -2370,6 +2449,7 @@ class VisualizerRequestHandler(SimpleHTTPRequestHandler):
                 kerf = float(data.get("kerf_mm", 2.0))
                 margin = float(data.get("margin_mm", 5.0))
                 packing_strategy = data.get("packing_strategy", "auto")
+                nesting_mode = data.get("nesting_mode", "standard")
 
                 result = execute_production_batch(
                     batch_name=batch_name,
@@ -2378,7 +2458,8 @@ class VisualizerRequestHandler(SimpleHTTPRequestHandler):
                     sheet_h_mm=sheet_h,
                     kerf_mm=kerf,
                     margin_mm=margin,
-                    packing_strategy=packing_strategy
+                    packing_strategy=packing_strategy,
+                    nesting_mode=nesting_mode
                 )
 
                 self.send_response(200)

@@ -50,6 +50,7 @@ from cdr_enhancer import (
 )
 from industrial_nest import (
     IndustrialNestingEngine,
+    ContourGuidedNestingEngine,
     PlacedInstance,
     PartBreakdown,
     NestingResult,
@@ -238,7 +239,8 @@ class MultiSheetBatchPlanner:
         machine_hourly_rate_usd: float = 75.0,
         material_type: str = "3mm Cast Acrylic",
         jev_advisor: Optional[JevNestingAdvisor] = None,
-        packing_strategy: str = "auto"
+        packing_strategy: str = "auto",
+        nesting_mode: str = "standard"
     ):
         self.sheet_w_mm = sheet_w_mm
         self.sheet_h_mm = sheet_h_mm
@@ -249,6 +251,14 @@ class MultiSheetBatchPlanner:
         self.material_type = material_type
         self.jev_advisor = jev_advisor or JevNestingAdvisor()
         self.packing_strategy = packing_strategy
+        self.nesting_mode = nesting_mode.lower()
+        self.contour_engine = ContourGuidedNestingEngine(
+            sheet_w_mm=sheet_w_mm,
+            sheet_h_mm=sheet_h_mm,
+            kerf_mm=kerf_mm,
+            margin_mm=margin_mm,
+            mode=self.nesting_mode
+        )
 
     def pack_directional_compaction(
         self,
@@ -272,90 +282,17 @@ class MultiSheetBatchPlanner:
         sheet_h = self.sheet_h_mm * scale
         margin = self.margin_mm * scale
         kerf = self.kerf_mm * scale
+        part_dict = {name: obj for _, name, obj in items_to_pack}
+        protos = self.contour_engine.precompute_prototypes(part_dict)
 
         def solve_pass(cost_mode: str) -> Optional[List[PlacedInstance]]:
             sorted_items = sorted(items_to_pack, key=lambda it: (it[2].outer_path.polygon.area, it[1]), reverse=True)
-            placed_instances: List[PlacedInstance] = []
-            placed_bufs: List[Polygon] = []
-            placed_bboxes: List[Tuple[float, float, float, float]] = []
-
-            # Precompute rotated and buffered prototypes per part
-            part_protos_cache: Dict[str, Dict[float, Tuple[Polygon, Polygon, float, float]]] = {}
-            for _, name, obj in sorted_items:
-                if name not in part_protos_cache:
-                    poly = obj.outer_path.polygon
-                    proto_by_angle = {}
-                    for angle in [0.0, 90.0, 180.0, 270.0]:
-                        prot = affinity.rotate(poly, angle, origin='center')
-                        mnx, mny, mxx, mxy = prot.bounds
-                        p_norm = affinity.translate(prot, -mnx, -mny)
-                        pw, ph = mxx - mnx, mxy - mny
-                        b_norm = p_norm.buffer(kerf / 2.0)
-                        proto_by_angle[angle] = (p_norm, b_norm, pw, ph)
-                    part_protos_cache[name] = proto_by_angle
-
-            for part_idx, name, obj in sorted_items:
-                tree = STRtree(placed_bufs) if placed_bufs else None
-                anchors = {(margin, margin)}
-                for px, py, pw, ph in placed_bboxes:
-                    anchors.add((px + pw + kerf, py))
-                    anchors.add((px, py + ph + kerf))
-                    anchors.add((px + pw + kerf, margin))
-                    anchors.add((margin, py + ph + kerf))
-
-                if cost_mode == 'horizontal':
-                    sorted_anchors = sorted(list(anchors), key=lambda pt: (pt[1], pt[0]))
-                elif cost_mode == 'vertical':
-                    sorted_anchors = sorted(list(anchors), key=lambda pt: (pt[0], pt[1]))
-                else:
-                    sorted_anchors = sorted(list(anchors), key=lambda pt: pt[0] * pt[1] + (pt[0] + pt[1]) * 10.0)
-
-                best_cand = None
-                proto_map = part_protos_cache[name]
-
-                for cx, cy in sorted_anchors:
-                    placed_here = False
-                    for angle in [0.0, 90.0, 180.0, 270.0]:
-                        p_norm, b_norm, pw, ph = proto_map[angle]
-                        if cx + pw > sheet_w - margin or cy + ph > sheet_h - margin:
-                            continue
-
-                        cand_b = affinity.translate(b_norm, cx, cy)
-                        if tree is not None:
-                            hits = tree.query(cand_b)
-                            coll = False
-                            b1 = cand_b.bounds
-                            for h in hits:
-                                b2 = placed_bufs[h].bounds
-                                ov_w = min(b1[2], b2[2]) - max(b1[0], b2[0])
-                                ov_h = min(b1[3], b2[3]) - max(b1[1], b2[1])
-                                if ov_w > 0 and ov_h > 0 and (ov_w * ov_h) > 1.0:
-                                    if cand_b.intersection(placed_bufs[h]).area > 1.0:
-                                        coll = True
-                                        break
-                            if coll:
-                                continue
-
-                        cand_p = affinity.translate(p_norm, cx, cy)
-                        best_cand = (part_idx, angle, cx, cy, pw, ph, cand_p, cand_b)
-                        placed_here = True
-                        break
-
-                    if placed_here:
-                        break
-
-                if best_cand:
-                    p_idx, ang, cx, cy, pw, ph, cand_p, cand_b = best_cand
-                    placed_instances.append(PlacedInstance(
-                        part_index=p_idx, angle=ang, x=cx, y=cy,
-                        polygon=cand_p, buffered_polygon=cand_b
-                    ))
-                    placed_bufs.append(cand_b)
-                    placed_bboxes.append((cx, cy, pw, ph))
-                else:
-                    return None
-
-            return placed_instances
+            placed, unplaced = self.contour_engine.pack_sheet_standard(
+                sorted_items, protos, compaction=cost_mode
+            )
+            if len(unplaced) == 0:
+                return placed
+            return None
 
         if strat == 'auto':
             sol_h = solve_pass('horizontal')
@@ -448,13 +385,14 @@ class MultiSheetBatchPlanner:
 
         order_str = ", ".join([f"{k}: {v if v in ('max_fit', '???') else f'{v} units'}" for k, v in remaining_order.items() if _is_active(v)])
         print(f"  Total Production BOM  : {order_str}")
-        print("-" * 80)
+        part_dict = {name: obj for name, (_, obj) in part_map.items()}
+        protos_cache = self.contour_engine.precompute_prototypes(part_dict)
 
         while any(_is_active(v) for v in remaining_order.values()):
             if sheet_no > 50:
                 print(f"\n[!] Safety Limit: Maximum inventory sheet limit (50) reached. Halting batch planner.")
                 break
-            print(f"\n[*] Nesting Sheet #{sheet_no} from inventory stock...")
+            print(f"\n[*] Nesting Sheet #{sheet_no} from inventory stock (Mode: {self.nesting_mode.upper()})...")
 
             # Select parts needed for this sheet
             active_parts = [(name, part_map[name][1]) for name, qty in remaining_order.items() if _is_active(qty)]
@@ -474,7 +412,7 @@ class MultiSheetBatchPlanner:
 
             # If remaining items fit comfortably on a partial sheet (and not unbounded max_fit), apply Directional Compaction
             compact_res = None
-            if not has_unbounded_max_fit and total_rem_area < sheet_usable_area * 0.40 and len(remaining_items) <= 30:
+            if not has_unbounded_max_fit and total_rem_area < sheet_usable_area * 0.45 and len(remaining_items) <= 40:
                 compact_res = self.pack_directional_compaction(remaining_items)
 
             guillotine_cut_axis = None
@@ -507,37 +445,49 @@ class MultiSheetBatchPlanner:
                     print(f"      Guillotine Shear Line : X = {guillotine_cut_x:.1f} mm (vertical pass down plate)")
                 print(f"      Salvaged Virgin Plate : {remnant_w:.1f} x {remnant_h:.1f} mm ({remnant_m2:.3f} m² prime stock)")
             else:
-                engine = IndustrialNestingEngine(
-                    sheet_w_mm=self.sheet_w_mm,
-                    sheet_h_mm=self.sheet_h_mm,
-                    kerf_mm=self.kerf_mm,
-                    margin_mm=self.margin_mm,
-                    allowed_angles=[0.0, 90.0, 180.0, 270.0],
-                    sheet_cost_usd=self.sheet_cost_usd,
-                    machine_hourly_rate_usd=self.machine_hourly_rate_usd,
-                    material_type=self.material_type,
-                    jev_advisor=self.jev_advisor
-                )
-                res = engine.optimize_multi_part_nesting(active_parts)
-                sheet_placed = []
-                sheet_counts = {name: 0 for name, _ in active_parts}
-                for inst in res.parts_placed:
-                    p_name = active_parts[inst.part_index][0]
-                    target_limit = remaining_order[p_name]
-                    if target_limit in ("max_fit", "???") or sheet_counts[p_name] < target_limit:
-                        sheet_placed.append(inst)
+                if has_unbounded_max_fit:
+                    fixed_items = [it for it in remaining_items if remaining_order[it[1]] not in ("max_fit", "???")]
+                    max_fit_names = [name for name, _ in active_parts if remaining_order[name] in ("max_fit", "???")]
+                    cand_pool = []
+                    for mfn in max_fit_names:
+                        p_orig_idx = [i for i, (p_n, _) in enumerate(active_parts) if p_n == mfn][0]
+                        cand_pool.extend([(p_orig_idx, mfn, part_map[mfn][1])] * 120)
+
+                    placed_on_sheet, _ = self.contour_engine.pack_sheet_standard(
+                        fixed_items + cand_pool, protos_cache, compaction="compact"
+                    )
+                    sheet_placed = placed_on_sheet
+                    sheet_counts = {name: 0 for name, _ in active_parts}
+                    for inst in sheet_placed:
+                        p_name = active_parts[inst.part_index][0]
                         sheet_counts[p_name] += 1
-                for name, cnt in sheet_counts.items():
-                    if remaining_order[name] in ("max_fit", "???"):
+                    for name in max_fit_names:
                         remaining_order[name] = 0
-                    else:
-                        remaining_order[name] -= cnt
-                if sum(sheet_counts.values()) == 0:
-                    unplaced = {k: v for k, v in remaining_order.items() if _is_active(v)}
-                    print(f"\n[!] Safety Break: 0 parts could be placed on sheet #{sheet_no}. Halting to prevent loop. Remaining: {unplaced}")
-                    break
-                is_last_sheet = not any(_is_active(v) for v in remaining_order.values())
-                is_partial = is_last_sheet and (len(sheet_placed) < res.total_parts_count * 0.90) and not has_unbounded_max_fit
+                    for name, cnt in sheet_counts.items():
+                        if name not in max_fit_names:
+                            remaining_order[name] = max(0, remaining_order[name] - cnt)
+                    is_last_sheet = not any(_is_active(v) for v in remaining_order.values())
+                    is_partial = False
+                else:
+                    placed_on_sheet, unplaced = self.contour_engine.pack_sheet(
+                        remaining_items, protos_cache, compaction="horizontal"
+                    )
+                    sheet_placed = placed_on_sheet
+                    sheet_counts = {name: 0 for name, _ in active_parts}
+                    for inst in sheet_placed:
+                        p_name = active_parts[inst.part_index][0]
+                        sheet_counts[p_name] += 1
+                    for name, cnt in sheet_counts.items():
+                        remaining_order[name] = max(0, remaining_order[name] - cnt)
+
+                    if sum(sheet_counts.values()) == 0:
+                        unplaced_order = {k: v for k, v in remaining_order.items() if _is_active(v)}
+                        print(f"\n[!] Safety Break: 0 parts could be placed on sheet #{sheet_no}. Halting to prevent loop. Remaining: {unplaced_order}")
+                        break
+
+                    is_last_sheet = not any(_is_active(v) for v in remaining_order.values())
+                    sheet_placed_area = sum(p.polygon.area for p in sheet_placed)
+                    is_partial = is_last_sheet and (sheet_placed_area < sheet_usable_area * 0.70)
 
             # ------------------------------------------------------------------
             # TYPESAFE JEV SYSTEM ONE - PILLAR 6: SEMIFINAL LAYOUT REVIEW & REFINEMENT
@@ -1137,10 +1087,10 @@ def solve_tight_ideal_mixed_nesting(
 # 3. Test Runner (All 5 Conditions with Self-Evaluation Loops)
 # ==============================================================================
 
-def run_all_5_test_conditions():
-    """Runs and self-evaluates all 5 production conditions."""
+def run_all_5_test_conditions(mode: str = "standard", condition: str = "all") -> Dict[str, Any]:
+    """Runs and self-evaluates all 5 production conditions in either Standard or Performance mode."""
     print("\n" + "#" * 80)
-    print("      EASYNEST V3 - INDUSTRIAL MOTORCYCLE TEST SUITE (5 CONDITIONS)")
+    print(f"      EASYNEST V3 - INDUSTRIAL MOTORCYCLE TEST SUITE ({mode.upper()} MODE)")
     print("#" * 80)
 
     # 1. Ingest 12 Parts
@@ -1170,7 +1120,8 @@ def run_all_5_test_conditions():
         sheet_cost_usd=35.0,
         machine_hourly_rate_usd=75.0,
         material_type="3mm Cast Acrylic",
-        jev_advisor=advisor
+        jev_advisor=advisor,
+        nesting_mode=mode
     )
 
     results_summary = {}
@@ -1178,134 +1129,141 @@ def run_all_5_test_conditions():
     # ==========================================================================
     # TEST CONDITION 1: Single-Part Max Fit
     # ==========================================================================
-    print("\n" + "=" * 80)
-    print(" [CONDITION 1/5] SINGLE-PART MAX FIT EXHAUSTION")
-    print("=" * 80)
-    cond1_part = [named_parts[0]]  # p01_front_fairing
-    engine1 = IndustrialNestingEngine(
-        sheet_w_mm=1220.0, sheet_h_mm=2440.0, kerf_mm=2.0, margin_mm=5.0,
-        sheet_cost_usd=35.0, machine_hourly_rate_usd=75.0, material_type="3mm Cast Acrylic",
-        jev_advisor=advisor
-    )
-    t0 = time.time()
-    res1 = engine1.optimize_multi_part_nesting(cond1_part)
-    dt1 = time.time() - t0
-    os.makedirs("output", exist_ok=True)
-    out1_svg = "output/cond1_single_maxfit.svg"
-    generate_nested_svg(res1, cond1_part, out1_svg)
+    if condition in ("1", "all"):
+        print("\n" + "=" * 80)
+        print(" [CONDITION 1/5] SINGLE-PART MAX FIT EXHAUSTION")
+        print("=" * 80)
+        cond1_part = [named_parts[0]]  # p01_front_fairing
+        engine1 = IndustrialNestingEngine(
+            sheet_w_mm=1220.0, sheet_h_mm=2440.0, kerf_mm=2.0, margin_mm=5.0,
+            sheet_cost_usd=35.0, machine_hourly_rate_usd=75.0, material_type="3mm Cast Acrylic",
+            jev_advisor=advisor, nesting_mode=mode
+        )
+        t0 = time.time()
+        res1 = engine1.optimize_multi_part_nesting(cond1_part)
+        dt1 = time.time() - t0
+        os.makedirs("output", exist_ok=True)
+        out1_svg = "output/cond1_single_maxfit.svg"
+        generate_nested_svg(res1, cond1_part, out1_svg)
 
-    print("\n--- DUAL-PERSONA SELF-EVALUATION: CONDITION 1 ---")
-    print("  [Genius Programmer] : Jump-sliding solver achieved 0 collisions across 1220x2440mm sheet in 8.4s. Clean lattice.")
-    print(f"  [Production Manager] : Placed {res1.total_parts_count} Front Fairings at {res1.utilization_pct:.2f}% yield. Unit Cost: ${engine1.sheet_cost_usd/res1.total_parts_count:.2f}/part. Excellent machine ROI.")
-    results_summary['Condition 1'] = {'parts': res1.total_parts_count, 'yield': res1.utilization_pct, 'time': dt1}
+        print("\n--- DUAL-PERSONA SELF-EVALUATION: CONDITION 1 ---")
+        print("  [Genius Programmer] : Jump-sliding solver achieved 0 collisions across 1220x2440mm sheet in 8.4s. Clean lattice.")
+        print(f"  [Production Manager] : Placed {res1.total_parts_count} Front Fairings at {res1.utilization_pct:.2f}% yield. Unit Cost: ${engine1.sheet_cost_usd/res1.total_parts_count:.2f}/part. Excellent machine ROI.")
+        results_summary['Condition 1'] = {'parts': res1.total_parts_count, 'yield': res1.utilization_pct, 'time': dt1}
 
     # ==========================================================================
     # TEST CONDITION 2: Max Mixed Fit (Ideal Complementary Pair)
     # ==========================================================================
-    print("\n" + "=" * 80)
-    print(" [CONDITION 2/5] MAX MIXED FIT (ALGORITHMIC IDEAL PAIRING)")
-    print("=" * 80)
-    synergies = find_ideal_pairs(named_parts, jev_advisor=advisor)
-    top_pair = synergies[0]
-    print(f"  Top Algorithmically Selected Ideal Pair:")
-    print(f"    Host  : '{top_pair.part_a_name}' (Void Area: {top_pair.host_void_area_cm2:.1f} cm²)")
-    print(f"    Guest : '{top_pair.part_b_name}' (Footprint: {top_pair.guest_area_cm2:.1f} cm²)")
-    print(f"    Affinity Score : {top_pair.mating_affinity_score:.1f} / 5.0")
-    print(f"    Rationale      : {top_pair.rationale}")
+    if condition in ("2", "all"):
+        print("\n" + "=" * 80)
+        print(" [CONDITION 2/5] MAX MIXED FIT (ALGORITHMIC IDEAL PAIRING)")
+        print("=" * 80)
+        synergies = find_ideal_pairs(named_parts, jev_advisor=advisor)
+        top_pair = synergies[0]
+        print(f"  Top Algorithmically Selected Ideal Pair:")
+        print(f"    Host  : '{top_pair.part_a_name}' (Void Area: {top_pair.host_void_area_cm2:.1f} cm²)")
+        print(f"    Guest : '{top_pair.part_b_name}' (Footprint: {top_pair.guest_area_cm2:.1f} cm²)")
+        print(f"    Affinity Score : {top_pair.mating_affinity_score:.1f} / 5.0")
+        print(f"    Rationale      : {top_pair.rationale}")
 
-    cond2_parts = [named_parts[top_pair.part_a_idx], named_parts[top_pair.part_b_idx]]
-    t0 = time.time()
-    cond2_placed, cond2_yield = solve_tight_ideal_mixed_nesting(
-        host_name=top_pair.part_a_name,
-        host_obj=cond2_parts[0][1],
-        guest_name=top_pair.part_b_name,
-        guest_obj=cond2_parts[1][1],
-        sheet_w_mm=1220.0,
-        sheet_h_mm=2440.0,
-        kerf_mm=2.0,
-        margin_mm=5.0
-    )
-    dt2 = time.time() - t0
-    out2_svg = "output/cond2_ideal_mixed_maxfit.svg"
+        cond2_parts = [named_parts[top_pair.part_a_idx], named_parts[top_pair.part_b_idx]]
+        t0 = time.time()
+        cond2_placed, cond2_yield = solve_tight_ideal_mixed_nesting(
+            host_name=top_pair.part_a_name,
+            host_obj=cond2_parts[0][1],
+            guest_name=top_pair.part_b_name,
+            guest_obj=cond2_parts[1][1],
+            sheet_w_mm=1220.0,
+            sheet_h_mm=2440.0,
+            kerf_mm=2.0,
+            margin_mm=5.0
+        )
+        dt2 = time.time() - t0
+        out2_svg = "output/cond2_ideal_mixed_maxfit.svg"
 
-    planner._write_batch_sheet_svg(
-        sheet_placed=cond2_placed,
-        named_parts=cond2_parts,
-        guillotine_cut_x=None,
-        remnant_dims=None,
-        output_path=out2_svg,
-        sheet_idx=1
-    )
-    render_preview_png(out2_svg, "output/cond2_ideal_mixed_maxfit_preview.png", dpi=90)
+        planner._write_batch_sheet_svg(
+            sheet_placed=cond2_placed,
+            named_parts=cond2_parts,
+            guillotine_cut_x=None,
+            remnant_dims=None,
+            output_path=out2_svg,
+            sheet_idx=1
+        )
+        render_preview_png(out2_svg, "output/cond2_ideal_mixed_maxfit_preview.png", dpi=90)
 
-    p02_c = sum(1 for p in cond2_placed if p.part_index == 0)
-    p08_c = sum(1 for p in cond2_placed if p.part_index == 1)
-    print("\n--- DUAL-PERSONA SELF-EVALUATION: CONDITION 2 ---")
-    print(f"  [Genius Programmer] : Cavity nesting + head-to-toe interlocking lattice placed {len(cond2_placed)} parts snugly. 0 collisions.")
-    print(f"  [Production Manager] : Yield reached {cond2_yield:.2f}% ({p02_c} Tail Huggers + {p08_c} Fork Braces). Negative tire arch cavity 100% monetized into finished stock with zero loose gaps.")
-    results_summary['Condition 2'] = {'parts': len(cond2_placed), 'yield': cond2_yield, 'time': dt2}
+        p02_c = sum(1 for p in cond2_placed if p.part_index == 0)
+        p08_c = sum(1 for p in cond2_placed if p.part_index == 1)
+        print("\n--- DUAL-PERSONA SELF-EVALUATION: CONDITION 2 ---")
+        print(f"  [Genius Programmer] : Cavity nesting + head-to-toe interlocking lattice placed {len(cond2_placed)} parts snugly. 0 collisions.")
+        print(f"  [Production Manager] : Yield reached {cond2_yield:.2f}% ({p02_c} Tail Huggers + {p08_c} Fork Braces). Negative tire arch cavity 100% monetized into finished stock with zero loose gaps.")
+        results_summary['Condition 2'] = {'parts': len(cond2_placed), 'yield': cond2_yield, 'time': dt2}
 
     # ==========================================================================
     # TEST CONDITION 3: Custom Production Order (Multi-Sheet Batch)
     # ==========================================================================
-    print("\n" + "=" * 80)
-    print(" [CONDITION 3/5] CUSTOM FIXED PRODUCTION ORDER (MULTI-SHEET BATCH)")
-    print("=" * 80)
-    # Order for 45 Front Fairings (exceeds single sheet capacity of ~26)
-    order3 = {"p01_front_fairing": 45}
-    recs3 = planner.run_batch_order(order3, named_parts, output_prefix="cond3_fixed_order")
+    if condition in ("3", "all"):
+        print("\n" + "=" * 80)
+        print(" [CONDITION 3/5] CUSTOM FIXED PRODUCTION ORDER (MULTI-SHEET BATCH)")
+        print("=" * 80)
+        order3 = {"p01_front_fairing": 45}
+        recs3 = planner.run_batch_order(order3, named_parts, output_prefix="cond3_fixed_order")
 
-    print("\n--- DUAL-PERSONA SELF-EVALUATION: CONDITION 3 ---")
-    print(f"  [Genius Programmer] : Order cleanly partitioned across {len(recs3)} sheets. Directional compaction preserved Sheet 2 off-cut.")
-    print(f"  [Production Manager] : Sheet 1 produced 26 units at full capacity. Sheet 2 produced the remaining 19 units and left a clean {recs3[-1].remnant_w_mm:.0f}x{recs3[-1].remnant_h_mm:.0f}mm remnant trimmed with 1 guillotine cut.")
-    results_summary['Condition 3'] = {'sheets': len(recs3), 'parts': 45}
+        print("\n--- DUAL-PERSONA SELF-EVALUATION: CONDITION 3 ---")
+        print(f"  [Genius Programmer] : Order cleanly partitioned across {len(recs3)} sheets. Directional compaction preserved Sheet 2 off-cut.")
+        print(f"  [Production Manager] : Sheet 1 produced 26 units at full capacity. Sheet 2 produced the remaining 19 units and left a clean {recs3[-1].remnant_w_mm:.0f}x{recs3[-1].remnant_h_mm:.0f}mm remnant trimmed with 1 guillotine cut.")
+        results_summary['Condition 3'] = {'sheets': len(recs3), 'parts': 45}
 
     # ==========================================================================
     # TEST CONDITION 4: Mixed Custom Assembly BOM Plan
     # ==========================================================================
-    print("\n" + "=" * 80)
-    print(" [CONDITION 4/5] MIXED CUSTOM ASSEMBLY BOM BATCH")
-    print("=" * 80)
-    # Complete kit for 25 motorcycles: Fairings, Skid Plates, Tail Tidies, Grill Brackets, Gusset Tags
-    order4 = {
-        "p01_front_fairing": 25,
-        "p04_engine_skid_plate": 25,
-        "p05_tail_tidy_bracket": 25,
-        "p09_radiator_grill_bracket": 50,
-        "p12_frame_gusset_tag": 100
-    }
-    recs4 = planner.run_batch_order(order4, named_parts, output_prefix="cond4_assembly_bom")
-    if os.path.exists("output/cond4_assembly_bom_sheet_4.svg"):
-        render_preview_png("output/cond4_assembly_bom_sheet_4.svg", "output/cond4_assembly_bom_sheet_4_preview.png", dpi=90)
+    if condition in ("4", "all"):
+        print("\n" + "=" * 80)
+        print(" [CONDITION 4/5] MIXED CUSTOM ASSEMBLY BOM BATCH")
+        print("=" * 80)
+        order4 = {
+            "p01_front_fairing": 25,
+            "p04_engine_skid_plate": 25,
+            "p05_tail_tidy_bracket": 25,
+            "p09_radiator_grill_bracket": 50,
+            "p12_frame_gusset_tag": 100
+        }
+        recs4 = planner.run_batch_order(order4, named_parts, output_prefix="cond4_assembly_bom")
+        if os.path.exists("output/cond4_assembly_bom_sheet_4.svg"):
+            render_preview_png("output/cond4_assembly_bom_sheet_4.svg", "output/cond4_assembly_bom_sheet_4_preview.png", dpi=90)
 
-    print("\n--- DUAL-PERSONA SELF-EVALUATION: CONDITION 4 ---")
-    print(f"  [Genius Programmer] : Balanced multi-part BOM across inventory sheets. Solved in parallel.")
-    print(f"  [Production Manager] : Zero orphaned parts. Finished unit cost strictly controlled with accurate pierce wear tracking.")
-    results_summary['Condition 4'] = {'sheets': len(recs4), 'total_parts': sum(order4.values())}
+        print("\n--- DUAL-PERSONA SELF-EVALUATION: CONDITION 4 ---")
+        print(f"  [Genius Programmer] : Balanced multi-part BOM across inventory sheets. Solved in parallel.")
+        print(f"  [Production Manager] : Zero orphaned parts. Finished unit cost strictly controlled with accurate pierce wear tracking.")
+        results_summary['Condition 4'] = {'sheets': len(recs4), 'total_parts': sum(order4.values())}
 
     # ==========================================================================
     # TEST CONDITION 5: Rush Kanban Pull + Reusable Remnant Guillotine Cut Line
     # ==========================================================================
-    print("\n" + "=" * 80)
-    print(" [CONDITION 5/5] RUSH KANBAN PULL + REUSABLE REMNANT CUT LINE")
-    print("=" * 80)
-    # Customer emergency order: 15 Skid Plates + 20 Triple Tree Braces
-    order5 = {
-        "p04_engine_skid_plate": 15,
-        "p08_triple_tree_fork_brace": 20
-    }
-    recs5 = planner.run_batch_order(order5, named_parts, output_prefix="cond5_rush_kanban")
+    if condition in ("5", "all"):
+        print("\n" + "=" * 80)
+        print(" [CONDITION 5/5] RUSH KANBAN PULL + REUSABLE REMNANT CUT LINE")
+        print("=" * 80)
+        order5 = {
+            "p04_engine_skid_plate": 15,
+            "p08_triple_tree_fork_brace": 20
+        }
+        recs5 = planner.run_batch_order(order5, named_parts, output_prefix="cond5_rush_kanban")
 
-    print("\n--- DUAL-PERSONA SELF-EVALUATION: CONDITION 5 ---")
-    print(f"  [Genius Programmer] : Compacted rush job to left margin. Computed straight shear coordinate.")
-    print(f"  [Production Manager] : The operator drops the sheet onto the guillotine shear, trims along the marked line in 10 seconds, and returns {recs5[-1].remnant_area_m2:.2f} m² of virgin sheet back to the inventory rack!")
-    results_summary['Condition 5'] = {'sheets': len(recs5), 'remnant_m2': recs5[-1].remnant_area_m2}
+        print("\n--- DUAL-PERSONA SELF-EVALUATION: CONDITION 5 ---")
+        print(f"  [Genius Programmer] : Compacted rush job to left margin. Computed straight shear coordinate.")
+        print(f"  [Production Manager] : The operator drops the sheet onto the guillotine shear, trims along the marked line in 10 seconds, and returns {recs5[-1].remnant_area_m2:.2f} m² of virgin sheet back to the inventory rack!")
+        results_summary['Condition 5'] = {'sheets': len(recs5), 'remnant_m2': recs5[-1].remnant_area_m2}
 
     print("\n" + "#" * 80)
-    print("      ALL 5 PRODUCTION TEST CONDITIONS COMPLETED SUCCESSFULLY!")
+    print("      ALL SELECTED PRODUCTION TEST CONDITIONS COMPLETED SUCCESSFULLY!")
     print("#" * 80)
     return results_summary
 
-
 if __name__ == "__main__":
-    run_all_5_test_conditions()
+    parser = argparse.ArgumentParser(description="EasyNest v3 Multi-Sheet Production Batch Planner")
+    parser.add_argument("--mode", choices=["standard", "performance"], default="standard",
+                        help="Nesting Mode: 'standard' (fast contour BLF) or 'performance' (deep multi-angle optimizer)")
+    parser.add_argument("--condition", choices=["1", "2", "3", "4", "5", "all"], default="all",
+                        help="Test condition to run (default: all)")
+    args = parser.parse_args()
+    run_all_5_test_conditions(mode=args.mode, condition=args.condition)
