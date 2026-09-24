@@ -902,6 +902,7 @@ def _superposition_universe_worker(task: Dict[str, Any]) -> Dict[str, Any]:
                     while y <= (y_max - gh):
                         x = x_min
                         while x <= (x_max - gw):
+                            cand_b = affinity.translate(pb, x, y)
                             raw_hits = tree.query(cand_b, predicate='intersects') if tree is not None else []
                             hits = [h for h in raw_hits if cand_b.intersection(placed_bufs[h]).area > 1.0]
                             if len(hits) == 0:
