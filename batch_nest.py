@@ -557,7 +557,7 @@ class MultiSheetBatchPlanner:
                     sheet_placed=sheet_placed,
                     named_parts=active_parts,
                     sheet_no=sheet_no,
-                    max_iterations=4
+                    max_iterations=2 if is_partial else 1
                 )
 
             # Calculate Guillotine Cut Line for partial sheet

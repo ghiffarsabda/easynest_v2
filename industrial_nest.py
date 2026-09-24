@@ -890,13 +890,16 @@ def _superposition_universe_worker(task: Dict[str, Any]) -> Dict[str, Any]:
                 }
 
             # Helper: Jump-sliding band scanner (skips obstacle interiors and advances past placed parts)
-            def scan_region(y_min: float, y_max: float, y_step: float, x_min: float, x_max: float, x_step: float, ang_list: List[float]):
+            def scan_region(y_min: float, y_max: float, default_y_step: float, x_min: float, x_max: float, default_x_step: float, ang_list: List[float]):
                 nonlocal tree, placed_bufs, all_placed
                 for a in ang_list:
                     pr = protos[a]
                     pb, pr_poly, gw, gh = pr['buf'], pr['poly'], pr['w'], pr['h']
                     if gw > (x_max - x_min) or gh > (y_max - y_min):
                         continue
+
+                    step_x = max(default_x_step, gw * 0.35)
+                    step_y = max(default_y_step, gh * 0.35)
 
                     y = y_min
                     while y <= (y_max - gh):
@@ -916,24 +919,24 @@ def _superposition_universe_worker(task: Dict[str, Any]) -> Dict[str, Any]:
                                 # Jump past rightmost colliding obstacle
                                 max_r = max(placed_bufs[h_idx].bounds[2] for h_idx in hits)
                                 if max_r > x:
-                                    x = max_r + 50.0
+                                    x = max(x + step_x, max_r + kerf)
                                 else:
-                                    x += x_step
-                        y += y_step
+                                    x += step_x
+                        y += step_y
 
             # Phase 1: High-Density Margins & Lateral Corridors (cardinal angles)
             cardinals = [90.0, 270.0, 0.0, 180.0]
             # Top Margin Band
-            scan_region(usable_min_y, min(usable_min_y + 18000.0, usable_max_y), 400.0, usable_min_x, usable_max_x, 400.0, cardinals)
+            scan_region(usable_min_y, min(usable_min_y + 18000.0, usable_max_y), 1000.0, usable_min_x, usable_max_x, 1000.0, cardinals)
             # Bottom Margin Band
-            scan_region(max(usable_min_y, usable_max_y - 25000.0), usable_max_y, 400.0, usable_min_x, usable_max_x, 400.0, cardinals)
+            scan_region(max(usable_min_y, usable_max_y - 25000.0), usable_max_y, 1000.0, usable_min_x, usable_max_x, 1000.0, cardinals)
             # Left Corridor
-            scan_region(usable_min_y, usable_max_y, 500.0, usable_min_x, min(usable_min_x + 15000.0, usable_max_x), 500.0, cardinals)
+            scan_region(usable_min_y, usable_max_y, 1200.0, usable_min_x, min(usable_min_x + 15000.0, usable_max_x), 1200.0, cardinals)
             # Right Corridor
-            scan_region(usable_min_y, usable_max_y, 500.0, max(usable_min_x, usable_max_x - 25000.0), usable_max_x, 500.0, cardinals)
+            scan_region(usable_min_y, usable_max_y, 1200.0, max(usable_min_x, usable_max_x - 25000.0), usable_max_x, 1200.0, cardinals)
 
             # Phase 2: Inter-Column Bays & Full Sheet Residual Void Probing
-            scan_region(usable_min_y, usable_max_y, 800.0, usable_min_x, usable_max_x, 800.0, [90.0, 270.0, 0.0, 180.0, 45.0, 135.0])
+            scan_region(usable_min_y, usable_max_y, 1500.0, usable_min_x, usable_max_x, 1500.0, cardinals)
 
     # Compute Metrics & Breakdown
     sheet_area_cm2 = (sheet_w_mm * sheet_h_mm) / 100.0
