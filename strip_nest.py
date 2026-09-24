@@ -27,7 +27,9 @@ from shapely import affinity
 from cdr_enhancer import (
     extract_paths_from_svg,
     build_isolated_objects,
-    IsolatedObject
+    IsolatedObject,
+    PathCommand,
+    CurvePath
 )
 
 try:
@@ -50,6 +52,10 @@ class StripPlacedPart:
     area_cm2: float
     transformed_poly: Polygon
     raw_obj: IsolatedObject
+    minx_raw: float = 0.0
+    miny_raw: float = 0.0
+    tx_mm: float = 0.0
+    ty_mm: float = 0.0
 
 
 @dataclass
@@ -135,7 +141,7 @@ class StripNestingEngine:
             p_area_cm2 = norm_poly.area / 100.0
             net_parts_area_cm2 += p_area_cm2 * qty
 
-            part_lookup[pname] = (idx, obj, norm_poly, pw_mm, ph_mm)
+            part_lookup[pname] = (idx, obj, norm_poly, pw_mm, ph_mm, minx, miny)
 
             # Simplify slightly for robust and fast boundary evaluation in Sparrow
             simp_poly = norm_poly.simplify(0.4, preserve_topology=True)
@@ -192,7 +198,7 @@ class StripNestingEngine:
             if pname not in part_lookup:
                 continue
 
-            idx, obj, norm_poly, pw, ph = part_lookup[pname]
+            idx, obj, norm_poly, pw, ph, minx_raw, miny_raw = part_lookup[pname]
             rot_deg = float(p.rotation)
             tx, ty = p.translation
 
@@ -218,7 +224,11 @@ class StripNestingEngine:
                     height_mm=p_maxy - p_miny,
                     area_cm2=placed_poly.area / 100.0,
                     transformed_poly=placed_poly,
-                    raw_obj=obj
+                    raw_obj=obj,
+                    minx_raw=minx_raw,
+                    miny_raw=miny_raw,
+                    tx_mm=tx,
+                    ty_mm=ty
                 )
             )
 
@@ -307,11 +317,11 @@ class StripNestingEngine:
             '  <defs>',
             '    <style>',
             '      .strip-plate { fill: #0f172a; stroke: #334155; stroke-width: 40; }',
-            '      .usable-margin { fill: none; stroke: #475569; stroke-dasharray: 120,120; stroke-width: 20; }',
-            '      .shear-line { stroke: #ef4444; stroke-dasharray: 200,100; stroke-width: 60; }',
-            '      .shear-badge { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 260px; font-weight: bold; fill: #ef4444; }',
+            '      .usable-margin { fill: none; stroke: #38bdf8; stroke-dasharray: 160,160; stroke-width: 25; }',
+            '      .shear-line { stroke: #ef4444; stroke-dasharray: 250,150; stroke-width: 80; }',
+            '      .shear-badge { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 320px; font-weight: bold; fill: #ef4444; }',
             '      .part-path { vector-effect: non-scaling-stroke; stroke-linejoin: round; stroke-linecap: round; }',
-            '      .part-label { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 140px; font-weight: bold; fill: #ffffff; }',
+            '      .part-label { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 150px; font-weight: 800; fill: #ffffff; pointer-events: none; }',
             '    </style>',
             '  </defs>',
             f'  <!-- Continuous Strip Stock ({strip_len_mm:.1f} x {strip_w_mm:.1f} mm) -->',
@@ -324,18 +334,41 @@ class StripNestingEngine:
         for idx, part in enumerate(res.parts_placed, start=1):
             fill_c, stroke_c, opacity = palettes[part.part_index % len(palettes)]
 
-            # Convert part.transformed_poly into SVG path string
-            poly = part.transformed_poly
-            svg_d = self._poly_to_svg_path_d(poly, scale)
+            rad = math.radians(part.angle_deg)
+            cos_a = math.cos(rad)
+            sin_a = math.sin(rad)
 
-            lines.append(f'  <g id="part_{idx}_{part.part_id}" data-part="{part.part_id}">')
+            def xform_coord(p: np.ndarray) -> np.ndarray:
+                x_mm = (p[0] / 100.0) - part.minx_raw
+                y_mm = (p[1] / 100.0) - part.miny_raw
+                rx = x_mm * cos_a - y_mm * sin_a + part.tx_mm + margin_mm
+                ry = x_mm * sin_a + y_mm * cos_a + part.ty_mm + margin_mm
+                return np.array([rx * scale, ry * scale])
+
+            def transform_curve(cp: CurvePath) -> CurvePath:
+                new_cmds = []
+                for c in cp.commands:
+                    if c.cmd == 'Z':
+                        new_cmds.append(PathCommand('Z', []))
+                    else:
+                        new_pts = [xform_coord(pt) for pt in c.points]
+                        new_cmds.append(PathCommand(c.cmd, new_pts))
+                return CurvePath.from_commands(new_cmds)
+
+            t_outer = transform_curve(part.raw_obj.outer_path)
+            t_holes = [transform_curve(h) for h in part.raw_obj.holes]
+            compound_d = t_outer.to_svg_d()
+            if t_holes:
+                compound_d += ' ' + ' '.join(h.to_svg_d() for h in t_holes)
+
+            lines.append(f'  <g id="part_{idx}_{part.part_id}" class="nested-part" data-part="{part.part_id}" data-part-name="{part.part_id}">')
             lines.append(
-                f'    <path class="part-path" d="{svg_d}" '
-                f'fill="{fill_c}" fill-opacity="{opacity}" stroke="{stroke_c}" stroke-width="25" fill-rule="evenodd" />'
+                f'    <path class="part-path" d="{compound_d}" '
+                f'fill="{fill_c}" fill-opacity="{opacity}" stroke="{stroke_c}" stroke-width="35" fill-rule="evenodd" />'
             )
 
             # Center label
-            cx, cy = poly.centroid.x * scale, poly.centroid.y * scale
+            cx, cy = part.transformed_poly.centroid.x * scale, part.transformed_poly.centroid.y * scale
             short_name = part.part_id.split('_')[0]
             lines.append(
                 f'    <text class="part-label" x="{cx:.1f}" y="{cy:.1f}" text-anchor="middle" dominant-baseline="central">'

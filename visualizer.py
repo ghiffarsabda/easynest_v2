@@ -1301,6 +1301,18 @@ HTML_PAGE = r"""<!DOCTYPE html>
       max-height: calc(100vh - 145px);
       max-width: 95vw;
       padding: 8px;
+      transition: all 0.2s ease;
+    }
+    .sheet-paper.is-strip-view {
+      max-height: calc(100vh - 145px);
+      max-width: 96vw;
+      overflow-x: auto !important;
+      overflow-y: hidden;
+      justify-content: flex-start;
+      border: 1px solid #334155;
+      padding: 12px;
+      scrollbar-width: thin;
+      scrollbar-color: #38bdf8 #0f172a;
     }
     #svg-host {
       display: flex;
@@ -1309,12 +1321,27 @@ HTML_PAGE = r"""<!DOCTYPE html>
       max-width: 100%;
       max-height: calc(100vh - 160px);
     }
+    #svg-host.is-strip-view {
+      display: block;
+      justify-content: flex-start;
+      max-width: none;
+      width: max-content;
+      min-width: 100%;
+    }
     #svg-host svg {
       max-height: calc(100vh - 160px);
       max-width: min(94vw, 1300px);
       width: auto;
       height: auto;
       display: block;
+      transition: transform 0.15s ease;
+    }
+    #svg-host.is-strip-view svg {
+      max-height: calc(100vh - 175px);
+      height: calc(100vh - 175px);
+      min-height: 500px;
+      max-width: none;
+      width: auto;
     }
 
     /* Nested part interactive highlight */
@@ -1753,6 +1780,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="viewer-nav-right">
         <span id="stat-sheet-dims" class="nav-meta-tag">1220 × 2440 mm</span>
         <span id="stat-total-parts" class="nav-meta-tag emerald">-</span>
+        <div class="zoom-controls" style="display: inline-flex; align-items: center; gap: 4px; background: #0f172a; padding: 2px 6px; border-radius: 6px; border: 1px solid #1e293b;">
+          <button class="btn btn-sm" onclick="zoomView(-0.25)" title="Zoom Out" style="padding: 2px 8px; font-weight: bold;">−</button>
+          <span id="zoom-level-text" style="font-size: 0.75rem; min-width: 42px; text-align: center; color: var(--text-dim);">100%</span>
+          <button class="btn btn-sm" onclick="zoomView(0.25)" title="Zoom In" style="padding: 2px 8px; font-weight: bold;">+</button>
+          <button class="btn btn-sm" onclick="resetZoom()" title="Reset Zoom" style="padding: 2px 8px; font-size: 0.7rem;">1:1</button>
+        </div>
         <button class="btn btn-sm" onclick="refreshAll()" title="Refresh All Data">↻</button>
       </div>
     </header>
@@ -2350,6 +2383,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
         const svgText = await res.text();
         svgHost.innerHTML = svgText;
 
+        const isStrip = !!(sheet.is_strip || (sheet.viewbox && parseFloat(sheet.viewbox.split(' ')[2]) / parseFloat(sheet.viewbox.split(' ')[3]) > 2.2));
+        const paper = document.querySelector('.sheet-paper');
+        if (paper) paper.classList.toggle('is-strip-view', isStrip);
+        if (svgHost) svgHost.classList.toggle('is-strip-view', isStrip);
+        resetZoom();
+
         const svgEl = svgHost.querySelector('svg');
         if (svgEl) {
           const vb = svgEl.getAttribute('viewBox');
@@ -2380,6 +2419,25 @@ HTML_PAGE = r"""<!DOCTYPE html>
         }
       } catch (err) {
         console.error('Failed to load SVG:', err);
+      }
+    }
+
+    let currentZoom = 1.0;
+    function zoomView(delta) {
+      currentZoom = Math.max(0.25, Math.min(4.0, Math.round((currentZoom + delta) * 100) / 100));
+      applyZoom();
+    }
+    function resetZoom() {
+      currentZoom = 1.0;
+      applyZoom();
+    }
+    function applyZoom() {
+      const zoomText = document.getElementById('zoom-level-text');
+      if (zoomText) zoomText.textContent = `${Math.round(currentZoom * 100)}%`;
+      const svgEl = svgHost.querySelector('svg');
+      if (svgEl) {
+        svgEl.style.transform = currentZoom === 1.0 ? '' : `scale(${currentZoom})`;
+        svgEl.style.transformOrigin = 'top left';
       }
     }
 
