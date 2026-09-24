@@ -1127,6 +1127,70 @@ def run_all_5_test_conditions(mode: str = "standard", condition: str = "all") ->
     results_summary = {}
 
     # ==========================================================================
+    # STRIP PACKING MODE (SPARROW SOTA)
+    # ==========================================================================
+    if mode == "strip":
+        from strip_nest import StripNestingEngine
+        named_parts_dict = dict(named_parts)
+        engine_strip = StripNestingEngine(
+            strip_width_mm=1220.0,
+            margin_mm=10.0,
+            kerf_mm=2.0,
+            time_budget_sec=15
+        )
+
+        if condition in ("1", "all"):
+            print("\n" + "=" * 80)
+            print(" [CONDITION 1/5 - STRIP MODE] SINGLE-PART STRIP PACKING (50 Fairings)")
+            print("=" * 80)
+            res1 = engine_strip.optimize_strip({"p01_front_fairing": 50}, named_parts_dict, job_name="cond1_single_maxfit_strip", output_svg_path="output/cond1_single_maxfit_strip.svg")
+            results_summary['Condition 1'] = {'min_length_mm': res1.min_strip_length_mm, 'density': res1.density_pct}
+
+        if condition in ("2", "all"):
+            print("\n" + "=" * 80)
+            print(" [CONDITION 2/5 - STRIP MODE] IDEAL PAIR STRIP PACKING (25 p02 + 26 p08)")
+            print("=" * 80)
+            res2 = engine_strip.optimize_strip({"p02_rear_tail_hugger": 25, "p08_triple_tree_fork_brace": 26}, named_parts_dict, job_name="cond2_ideal_pair_strip", output_svg_path="output/cond2_ideal_mixed_maxfit_strip.svg")
+            results_summary['Condition 2'] = {'min_length_mm': res2.min_strip_length_mm, 'density': res2.density_pct}
+
+        if condition in ("3", "all"):
+            print("\n" + "=" * 80)
+            print(" [CONDITION 3/5 - STRIP MODE] FIXED ORDER (45 Fairings)")
+            print("=" * 80)
+            res3 = engine_strip.optimize_strip({"p01_front_fairing": 45}, named_parts_dict, job_name="cond3_fixed_order_strip", output_svg_path="output/cond3_fixed_order_sheet_1_strip.svg")
+            results_summary['Condition 3'] = {'min_length_mm': res3.min_strip_length_mm, 'density': res3.density_pct}
+
+        if condition in ("4", "all"):
+            print("\n" + "=" * 80)
+            print(" [CONDITION 4/5 - STRIP MODE] 25-BIKE ASSEMBLY BOM (225 Parts)")
+            print("=" * 80)
+            order4 = {
+                "p01_front_fairing": 25,
+                "p04_engine_skid_plate": 25,
+                "p05_tail_tidy_bracket": 25,
+                "p09_radiator_grill_bracket": 50,
+                "p12_frame_gusset_tag": 100
+            }
+            res4 = engine_strip.optimize_strip(order4, named_parts_dict, job_name="cond4_assembly_bom_strip", output_svg_path="output/cond4_assembly_bom_strip.svg")
+            results_summary['Condition 4'] = {'min_length_mm': res4.min_strip_length_mm, 'density': res4.density_pct}
+
+        if condition in ("5", "all"):
+            print("\n" + "=" * 80)
+            print(" [CONDITION 5/5 - STRIP MODE] RUSH KANBAN PULL (35 Parts)")
+            print("=" * 80)
+            order5 = {
+                "p04_engine_skid_plate": 15,
+                "p08_triple_tree_fork_brace": 20
+            }
+            res5 = engine_strip.optimize_strip(order5, named_parts_dict, job_name="cond5_rush_kanban_strip", output_svg_path="output/cond5_rush_kanban_strip.svg")
+            results_summary['Condition 5'] = {'min_length_mm': res5.min_strip_length_mm, 'density': res5.density_pct}
+
+        print("\n" + "#" * 80)
+        print("      ALL STRIP PACKING CONDITIONS COMPLETED SUCCESSFULLY!")
+        print("#" * 80)
+        return results_summary
+
+    # ==========================================================================
     # TEST CONDITION 1: Single-Part Max Fit
     # ==========================================================================
     if condition in ("1", "all"):
@@ -1261,8 +1325,8 @@ def run_all_5_test_conditions(mode: str = "standard", condition: str = "all") ->
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="EasyNest v3 Multi-Sheet Production Batch Planner")
-    parser.add_argument("--mode", choices=["standard", "performance"], default="standard",
-                        help="Nesting Mode: 'standard' (fast contour BLF) or 'performance' (deep multi-angle optimizer)")
+    parser.add_argument("--mode", choices=["standard", "performance", "strip"], default="standard",
+                        help="Nesting Mode: 'standard' (fast contour BLF), 'performance' (deep multi-angle optimizer), or 'strip' (Sparrow SOTA continuous strip packer)")
     parser.add_argument("--condition", choices=["1", "2", "3", "4", "5", "all"], default="all",
                         help="Test condition to run (default: all)")
     args = parser.parse_args()

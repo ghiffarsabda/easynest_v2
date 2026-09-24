@@ -26,6 +26,8 @@ from typing import Dict, Any, List, Optional, Tuple
 
 PORT = 8080
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
 OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 PARTS_DIR = os.path.join(BASE_DIR, "parts")
 
@@ -187,6 +189,19 @@ def parse_sheet_metadata(svg_path: str) -> Dict[str, Any]:
     remnant_match = re.search(r'REUSABLE VIRGIN REMNANT\s*\(([^\)]+)\)', content)
     remnant_dims = remnant_match.group(1).strip() if remnant_match else None
 
+    # Strip mode detection
+    is_strip = ("strip" in filename) or ("strip-plate" in content) or ("shear-line" in content)
+    strip_info = None
+    if is_strip:
+        len_match = re.search(r'GUILLOTINE SHEAR LINE:\s*L\s*=\s*([0-9.]+)\s*mm', content)
+        den_match = re.search(r'DENSITY:\s*([0-9.]+)%', content)
+        w_match = re.search(r'height="([0-9.]+)mm"', content)
+        strip_info = {
+            "min_length_mm": float(len_match.group(1)) if len_match else 0.0,
+            "density_pct": float(den_match.group(1)) if den_match else 0.0,
+            "strip_width_mm": float(w_match.group(1)) if w_match else 1220.0
+        }
+
     # Fill mode detection
     is_fill = ("FILL MODE" in content or "EASYNEST FILL MODE" in content or "filler-label" in content)
     fill_info = None
@@ -211,6 +226,9 @@ def parse_sheet_metadata(svg_path: str) -> Dict[str, Any]:
     if sheet_match:
         sheet_num = int(sheet_match.group(1))
         batch_id = filename[:sheet_match.start()]
+    elif filename.endswith("_strip.svg"):
+        sheet_num = 1
+        batch_id = filename[:-4]
     elif "cond1" in filename:
         batch_id = "cond1_single_maxfit"
     elif "cond2" in filename:
@@ -227,6 +245,10 @@ def parse_sheet_metadata(svg_path: str) -> Dict[str, Any]:
     }
     if batch_id in friendly_batch_titles:
         batch_title = friendly_batch_titles[batch_id]
+        if is_strip:
+            batch_title = f"📏 Strip: {batch_title}"
+    elif is_strip:
+        batch_title = f"📏 Strip: {batch_id.replace('_', ' ').title()}"
     elif is_fill and fill_info:
         batch_title = f"⚡ Fill: {fill_info['primary_name']} + {fill_info['filler_name']}"
     else:
@@ -254,6 +276,8 @@ def parse_sheet_metadata(svg_path: str) -> Dict[str, Any]:
         "total_parts": len(parts),
         "part_counts": part_counts,
         "is_partial": is_partial,
+        "is_strip": is_strip,
+        "strip_info": strip_info,
         "is_fill": is_fill,
         "fill_info": fill_info,
         "jev_review": jev_review,
@@ -346,6 +370,43 @@ def execute_production_batch(
         safe_slug = re.sub(r'[^a-zA-Z0-9_-]', '_', batch_name.strip())
         if not safe_slug:
             safe_slug = f"batch_{int(time.time())}"
+
+        # Strip Mode execution (Sparrow SOTA)
+        if nesting_mode == "strip":
+            from strip_nest import StripNestingEngine
+            named_dict = dict(named_parts)
+            strip_order = {k: (25 if v == "max_fit" else v) for k, v in clean_order.items()}
+            strip_engine = StripNestingEngine(
+                strip_width_mm=sheet_w_mm,
+                margin_mm=margin_mm,
+                kerf_mm=kerf_mm,
+                time_budget_sec=20
+            )
+            out_svg = f"output/{safe_slug}_strip.svg"
+            t0 = time.time()
+            strip_res = strip_engine.optimize_strip(strip_order, named_dict, job_name=safe_slug, output_svg_path=out_svg)
+            runtime_s = round(time.time() - t0, 2)
+
+            return {
+                "success": True,
+                "is_strip_mode": True,
+                "batch_id": safe_slug,
+                "batch_title": f"📏 Strip: {safe_slug.replace('_', ' ').title()}",
+                "total_parts_ordered": sum(strip_order.values()),
+                "total_parts_produced": strip_res.total_parts_placed,
+                "sheets_count": 1,
+                "min_strip_length_mm": round(strip_res.min_strip_length_mm, 1),
+                "strip_width_mm": round(strip_res.strip_width_mm, 1),
+                "density_pct": round(strip_res.density_pct, 1),
+                "guillotine_shear_x_mm": round(strip_res.guillotine_shear_x_mm, 1),
+                "total_material_area_m2": round(strip_res.total_material_area_m2, 3),
+                "net_parts_area_m2": round(strip_res.net_parts_area_m2, 3),
+                "scrap_area_m2": round(strip_res.scrap_area_m2, 3),
+                "salvaged_remnant_m2": 0.0,
+                "runtime_seconds": runtime_s,
+                "output_svg_path": out_svg,
+                "jev_reviews": []
+            }
 
         planner = MultiSheetBatchPlanner(
             sheet_w_mm=sheet_w_mm,
@@ -840,7 +901,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     /* Nesting Mode Selector */
     .nesting-mode-selector {
       display: grid;
-      grid-template-columns: 1fr 1fr;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
       gap: 0.75rem;
       width: 100%;
     }
@@ -865,6 +926,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
       background: linear-gradient(135deg, #0d2340, #0a192f);
       box-shadow: 0 0 14px rgba(2, 132, 199, 0.35);
     }
+    .mode-pill-option.mode-strip.active {
+      border-color: #059669;
+      background: linear-gradient(135deg, #062b21, #081d19);
+      box-shadow: 0 0 14px rgba(16, 185, 129, 0.35);
+    }
     .mode-pill-badge {
       font-size: 0.85rem;
       font-weight: 700;
@@ -876,9 +942,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
     .mode-badge-perf {
       color: #c084fc;
     }
+    .mode-badge-strip {
+      color: #34d399;
+    }
     .mode-pill-option.active .mode-badge-perf {
       color: #d8b4fe;
       text-shadow: 0 0 10px rgba(192, 132, 252, 0.5);
+    }
+    .mode-pill-option.active .mode-badge-strip {
+      color: #6ee7b7;
+      text-shadow: 0 0 10px rgba(52, 211, 153, 0.5);
     }
     .mode-pill-desc {
       font-size: 0.72rem;
@@ -1477,6 +1550,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
               <span class="mode-pill-badge mode-badge-perf">🧬 Performance Mode (Option B)</span>
               <span class="mode-pill-desc">Deep Multi-Angle Optimizer &amp; Parallel 4-Core Tournament. Explores 24 angles &amp; permutations for maximum yield (~25–40s).</span>
             </div>
+            <div class="mode-pill-option mode-strip" id="pill-mode-strip" onclick="selectNestingMode('strip')">
+              <span class="mode-pill-badge mode-badge-strip">📏 Strip Mode (Sparrow SOTA)</span>
+              <span class="mode-pill-desc">Continuous Coil &amp; Open Strip Packing. Rust jagua-rs solver compresses parts along open length to minimize cutoff length.</span>
+            </div>
           </div>
         </div>
       </div>
@@ -1902,8 +1979,20 @@ HTML_PAGE = r"""<!DOCTYPE html>
       selectedNestingMode = mode;
       const stdPill = document.getElementById('pill-mode-standard');
       const perfPill = document.getElementById('pill-mode-performance');
+      const stripPill = document.getElementById('pill-mode-strip');
       if (stdPill) stdPill.classList.toggle('active', mode === 'standard');
       if (perfPill) perfPill.classList.toggle('active', mode === 'performance');
+      if (stripPill) stripPill.classList.toggle('active', mode === 'strip');
+
+      const sheetSizeLabel = document.querySelector('label[for="select-sheet-size"]');
+      const packingStrategySelect = document.getElementById('select-packing-strategy');
+      if (mode === 'strip') {
+        if (sheetSizeLabel) sheetSizeLabel.textContent = 'Continuous Strip / Coil Width';
+        if (packingStrategySelect) packingStrategySelect.parentElement.style.opacity = '0.35';
+      } else {
+        if (sheetSizeLabel) sheetSizeLabel.textContent = 'Sheet Size Preset';
+        if (packingStrategySelect) packingStrategySelect.parentElement.style.opacity = '1.0';
+      }
     }
 
     // Process Batch Run (POST /api/run_batch)
@@ -1917,10 +2006,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
       const overlay = document.getElementById('progress-overlay');
       overlay.style.display = 'flex';
-      document.getElementById('progress-text').textContent = `Processing Batch (${selectedNestingMode === 'performance' ? 'Performance Mode' : 'Standard Mode'}): ${batchName}...`;
-      document.getElementById('progress-subtext').textContent = selectedNestingMode === 'performance'
-        ? 'Evaluating multi-universe multi-angle permutations concurrently on 4 CPU cores...'
-        : 'Allocating orders with contour-guided BLF, zipper twin pairing & part-in-hole nesting...';
+      if (selectedNestingMode === 'strip') {
+        document.getElementById('progress-text').textContent = `Compressing Continuous Strip (Sparrow SOTA): ${batchName}...`;
+        document.getElementById('progress-subtext').textContent = 'Rust jagua-rs solver executing 2D irregular strip packing and rubber-band compaction...';
+      } else if (selectedNestingMode === 'performance') {
+        document.getElementById('progress-text').textContent = `Processing Batch (Performance Mode): ${batchName}...`;
+        document.getElementById('progress-subtext').textContent = 'Evaluating multi-universe multi-angle permutations concurrently on 4 CPU cores...';
+      } else {
+        document.getElementById('progress-text').textContent = `Processing Batch (Standard Mode): ${batchName}...`;
+        document.getElementById('progress-subtext').textContent = 'Allocating orders with contour-guided BLF, zipper twin pairing & part-in-hole nesting...';
+      }
 
       try {
         const res = await fetch('/api/run_batch', {
@@ -1938,6 +2033,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
           })
         });
 
+        if (!res.ok) {
+          const errText = await res.text();
+          throw new Error(`Server returned status ${res.status}: ${errText.slice(0, 150)}`);
+        }
         const result = await res.json();
         overlay.style.display = 'none';
 
@@ -2087,6 +2186,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
           })
         });
 
+        if (!res.ok) {
+          const errText = await res.text();
+          throw new Error(`Server returned status ${res.status}: ${errText.slice(0, 150)}`);
+        }
         const result = await res.json();
         overlay.style.display = 'none';
 
@@ -2182,16 +2285,28 @@ HTML_PAGE = r"""<!DOCTYPE html>
         fillPill.style.display = 'none';
       }
 
-      const axis = sheet.cut_axis ? sheet.cut_axis.toUpperCase() : (sheet.cut_y_mm ? 'Y' : 'X');
-      const cutPos = sheet.cut_pos_mm || sheet.cut_y_mm || sheet.cut_x_mm;
-      if (!sheet.is_fill && cutPos && sheet.remnant_dims) {
+      if (sheet.is_strip && sheet.strip_info) {
+        const si = sheet.strip_info;
         remnantPill.style.display = 'inline-flex';
-        remnantPill.innerHTML = `✂ Shear Cut @ ${axis} = ${cutPos.toFixed(1)} mm • Remnant: ${sheet.remnant_dims}`;
-      } else if (!sheet.is_fill && cutPos) {
-        remnantPill.style.display = 'inline-flex';
-        remnantPill.innerHTML = `✂ Shear Cut @ ${axis} = ${cutPos.toFixed(1)} mm`;
+        remnantPill.style.background = 'rgba(16, 185, 129, 0.2)';
+        remnantPill.style.color = '#34d399';
+        remnantPill.style.borderColor = 'rgba(16, 185, 129, 0.4)';
+        remnantPill.innerHTML = `✂ Strip Cutoff @ X = ${si.min_length_mm.toFixed(1)} mm • Density: ${si.density_pct.toFixed(1)}%`;
       } else {
-        remnantPill.style.display = 'none';
+        remnantPill.style.background = '';
+        remnantPill.style.color = '';
+        remnantPill.style.borderColor = '';
+        const axis = sheet.cut_axis ? sheet.cut_axis.toUpperCase() : (sheet.cut_y_mm ? 'Y' : 'X');
+        const cutPos = sheet.cut_pos_mm || sheet.cut_y_mm || sheet.cut_x_mm;
+        if (!sheet.is_fill && cutPos && sheet.remnant_dims) {
+          remnantPill.style.display = 'inline-flex';
+          remnantPill.innerHTML = `✂ Shear Cut @ ${axis} = ${cutPos.toFixed(1)} mm • Remnant: ${sheet.remnant_dims}`;
+        } else if (!sheet.is_fill && cutPos) {
+          remnantPill.style.display = 'inline-flex';
+          remnantPill.innerHTML = `✂ Shear Cut @ ${axis} = ${cutPos.toFixed(1)} mm`;
+        } else {
+          remnantPill.style.display = 'none';
+        }
       }
 
       const jevPill = document.getElementById('top-jev-pill');

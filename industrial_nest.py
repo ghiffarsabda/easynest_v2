@@ -340,7 +340,14 @@ class ContourGuidedNestingEngine:
         anchors = {(self.usable_min_x, self.usable_min_y)}
         tested_angles = allowed_angles or self.angles
 
-        for p_orig_idx, p_name, p_obj in items_to_pack:
+        # Always sort parts largest to smallest so small parts tuck into voids and holes
+        sorted_items = sorted(
+            items_to_pack,
+            key=lambda it: protos_cache[it[1]][list(protos_cache[it[1]].keys())[0]]['area'],
+            reverse=True
+        )
+
+        for p_orig_idx, p_name, p_obj in sorted_items:
             proto_map = protos_cache[p_name]
             p_area = proto_map[list(proto_map.keys())[0]]['area']
 
@@ -363,12 +370,7 @@ class ContourGuidedNestingEngine:
                         cy = (hb[1] + hb[3] - ph) / 2.0
                         cand_b = affinity.translate(pr['buf'], cx, cy)
                         if h_poly.contains(cand_b):
-                            coll = False
-                            for pi in placed_inside:
-                                if cand_b.overlaps(pi) or cand_b.within(pi) or pi.within(cand_b):
-                                    coll = True
-                                    break
-                            if not coll:
+                            if not any(cand_b.intersects(pi) for pi in placed_inside):
                                 cand_p = affinity.translate(pr['poly'], cx, cy)
                                 inst = PlacedInstance(p_orig_idx, ang, cx, cy, cand_p, cand_b)
                                 placed_instances.append(inst)
@@ -387,17 +389,20 @@ class ContourGuidedNestingEngine:
             elif compaction == "vertical":
                 sorted_anchors = sorted(list(anchors), key=lambda pt: (pt[0], pt[1]))
             else:
-                sorted_anchors = sorted(list(anchors), key=lambda pt: pt[0] * pt[1] + 10.0 * (pt[0] + pt[1]))
+                sorted_anchors = sorted(list(anchors), key=lambda pt: pt[0] * pt[1])
 
             best_placement = None
             best_cost = float('inf')
+            best_by2 = float('inf')
 
             num_placed = len(placed_bboxes)
             bboxes_arr = np.array(placed_bboxes) if num_placed > 0 else None
 
+            evaluated_anchors = 0
             for ax, ay in sorted_anchors:
-                if compaction == "horizontal" and ay >= best_cost:
+                if compaction == "horizontal" and ay >= best_by2:
                     break
+                evaluated_anchors += 1
 
                 for ang in tested_angles:
                     pr = proto_map.get(ang)
@@ -410,7 +415,7 @@ class ContourGuidedNestingEngine:
                     if bx2 > self.usable_max_x or by2 > self.usable_max_y:
                         continue
 
-                    # Fast AABB collision filter
+                    # Fast vectorized AABB collision filter
                     coll = False
                     if bboxes_arr is not None:
                         overlap = (bboxes_arr[:, 0] < bx2) & (bboxes_arr[:, 2] > ax) & (bboxes_arr[:, 1] < by2) & (bboxes_arr[:, 3] > ay)
@@ -419,8 +424,7 @@ class ContourGuidedNestingEngine:
                         if len(hit_indices) > 0:
                             cand_b = affinity.translate(pr['buf'], ax, ay)
                             for h in hit_indices:
-                                pb = placed_bufs[h]
-                                if cand_b.overlaps(pb) or cand_b.within(pb) or pb.within(cand_b):
+                                if cand_b.intersects(placed_bufs[h]):
                                     coll = True
                                     break
                     if coll:
@@ -435,11 +439,11 @@ class ContourGuidedNestingEngine:
 
                     if cost < best_cost:
                         best_cost = cost
+                        best_by2 = by2
                         best_placement = (p_orig_idx, ang, ax, ay, pw, ph, pr)
-                        if self.mode == "standard":
-                            break
 
-                if best_placement and self.mode == "standard":
+                # Cap anchor search once a valid placement is found to top 35 candidates
+                if best_placement and evaluated_anchors >= 35:
                     break
 
             if best_placement:
@@ -515,25 +519,19 @@ class ContourGuidedNestingEngine:
 
         # Universe 1: Area-Descending (Largest Host Parts First)
         u1_items = sorted(items_to_pack, key=lambda it: it[2].outer_path.polygon.area, reverse=True)
-        universes.append(("Universe 1: Area-Descending (Largest First)", u1_items, [0.0, 180.0, 90.0, 270.0]))
+        universes.append(("Universe 1: Area-Descending (Horizontal)", u1_items, [0.0, 180.0, 90.0, 270.0], "horizontal"))
 
-        # Universe 2: Fine 15° Multi-Angle Contour Docking
-        angles_24 = [float(a) for a in range(0, 360, 15)]
-        universes.append(("Universe 2: Fine 15° Multi-Angle Glide", u1_items, angles_24))
+        # Universe 2: Zipper Twin Interlocking (Inverted 180° priority)
+        universes.append(("Universe 2: Zipper Twin Interlocking", u1_items, [180.0, 0.0, 90.0, 270.0], "horizontal"))
 
-        # Universe 3: Slender Aspect-Ratio Priority
-        u3_items = sorted(items_to_pack, key=lambda it: max(it[2].width, it[2].height) / max(1.0, min(it[2].width, it[2].height)), reverse=True)
-        universes.append(("Universe 3: Slender Aspect-Ratio Priority", u3_items, [0.0, 90.0, 180.0, 270.0]))
+        # Universe 3: Vertical Column Strip (packs along Y first)
+        universes.append(("Universe 3: Vertical Column Strip", u1_items, [90.0, 270.0, 0.0, 180.0], "vertical"))
 
-        # Universe 4: Concave Pocket Priority (Parts with deep cavities first to maximize mating)
-        def convexity_score(it):
-            poly = it[2].outer_path.polygon
-            return poly.area / max(1.0, poly.convex_hull.area)
-        u4_items = sorted(items_to_pack, key=convexity_score)
-        universes.append(("Universe 4: Concave Pocket Priority", u4_items, [0.0, 180.0, 90.0, 270.0]))
+        # Universe 4: Corner Compact Envelope (Minimizes corner envelope X*Y)
+        universes.append(("Universe 4: Corner Compact Envelope", u1_items, [0.0, 180.0, 90.0, 270.0], "compact"))
 
         tasks = []
-        for uname, u_items, u_angles in universes:
+        for uname, u_items, u_angles, u_comp in universes:
             tasks.append({
                 'universe_name': uname,
                 'order_items': u_items,
@@ -543,16 +541,14 @@ class ContourGuidedNestingEngine:
                 'kerf_mm': self.kerf_mm,
                 'margin_mm': self.margin_mm,
                 'scale': self.scale,
-                'compaction': compaction,
+                'compaction': u_comp,
                 'allowed_angles': u_angles
             })
 
-        num_cores = min(multiprocessing.cpu_count(), len(tasks))
-        print(f"\n[*] Performance Mode Activated: Evaluating {len(tasks)} universes concurrently on {num_cores} CPU cores...")
+        print(f"\n[*] Performance Mode Activated: Evaluating {len(tasks)} universes tournament...")
 
         t_pool = time.time()
-        with multiprocessing.Pool(processes=num_cores) as pool:
-            results = pool.map(_performance_universe_worker, tasks)
+        results = [_performance_universe_worker(task) for task in tasks]
         dt_pool = time.time() - t_pool
 
         results.sort(key=lambda r: r['fitness'], reverse=True)
@@ -565,7 +561,7 @@ class ContourGuidedNestingEngine:
             print(f"      Parts Placed   : {r['placed_count']} units | Yield: {r['utilization_pct']:.1f}% | Scrap: {r['scrap_pct']:.1f}%")
             print(f"      Max Dimension  : Y = {r['max_y']:.1f} mm, X = {r['max_x']:.1f} mm | Runtime: {r['runtime']:.2f}s | Fitness: {r['fitness']:.1f}")
             print("-" * 80)
-        print(f"[*] Tournament Concluded in {dt_pool:.2f}s across {num_cores} cores.")
+        print(f"[*] Tournament Concluded in {dt_pool:.2f}s across {len(tasks)} universes.")
         print("=" * 80 + "\n")
 
         champ = results[0]
